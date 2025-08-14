@@ -79,6 +79,15 @@ static const esp_cam_sensor_isp_info_t ov5647_isp_info[] = {
             .bayer_type = ESP_CAM_SENSOR_BAYER_GBRG,
         }
     },
+	{
+        .isp_v1_info = {
+            .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
+            .pclk = 100000000,                  
+            .vts = 3516,                       
+            .hts = 1896,                       
+            .bayer_type = ESP_CAM_SENSOR_BAYER_GBRG, 
+        }
+	}
 };
 
 static const esp_cam_sensor_format_t ov5647_format_info[] = {
@@ -172,6 +181,24 @@ static const esp_cam_sensor_format_t ov5647_format_info[] = {
         },
         .reserved = NULL,
     },
+	{
+		.name = "MIPI_2lane_24Minput_RAW8_800x640_15fps",
+		.format = ESP_CAM_SENSOR_PIXFORMAT_RAW8,
+		.port = ESP_CAM_SENSOR_MIPI_CSI,
+		.xclk = 24000000,
+		.width = 800,
+		.height = 640,
+		.regs = ov5647_input_24M_MIPI_2lane_raw8_800x640_15fps,
+		.regs_size = ARRAY_SIZE(ov5647_input_24M_MIPI_2lane_raw8_800x640_15fps),
+		.fps = 15,
+		.isp_info = &ov5647_isp_info[5],  
+		.mipi_info = {
+			.mipi_clk = OV5647_MIPI_CSI_LINE_RATE_800x640_15FPS, 
+			.lane_num = 2,
+			.line_sync_en = CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE ? true : false,
+		},
+		.reserved = NULL,
+	},
 };
 
 static esp_err_t ov5647_read(esp_sccb_io_handle_t sccb_handle, uint16_t reg, uint8_t *read_buf)

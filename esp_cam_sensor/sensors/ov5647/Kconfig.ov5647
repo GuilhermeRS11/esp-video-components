@@ -18,7 +18,7 @@ if CAMERA_OV5647
 
     choice CAMERA_OV5647_MIPI_DEFAULT_FMT
         prompt "Select default output format for MIPI CSI interface"
-        default CAMERA_OV5647_MIPI_RAW8_800X800_50FPS
+        default CAMERA_OV5647_MIPI_RAW8_800X640_15FPS
         help
             This option allows you to select the default video format for the OV5647 sensor
             when it is initialized on the MIPI CSI interface. The selected format will be used
@@ -50,6 +50,11 @@ if CAMERA_OV5647
             help
                 RAW10 color format at 1280x960 resolution (SXGA) with 45fps framerate.
                 Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+        config CAMERA_OV5647_MIPI_RAW8_800X640_15FPS
+            bool "OV5647 MIPI RAW8 800x640 15fps"
+            help
+                RAW8 color format at 800x640 resolution (WVGA) with 15fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
     endchoice # CAMERA_OV5647_MIPI_DEFAULT_FMT
 
     config CAMERA_OV5647_MIPI_IF_FORMAT_INDEX_DEFAULT
@@ -59,6 +64,8 @@ if CAMERA_OV5647
         default 2 if CAMERA_OV5647_MIPI_RAW8_800X800_50FPS
         default 3 if CAMERA_OV5647_MIPI_RAW10_1920X1080_30FPS
         default 4 if CAMERA_OV5647_MIPI_RAW10_1280X960_BINNING_45FPS
+        default 5 if CAMERA_OV5647_MIPI_RAW8_800X640_15FPS		
+        default 6 if CAMERA_OV5647_MIPI_RAW8_800X640_15FPS
         help
             Sets the default configuration for the MIPI CSI interface.
             Use query_support_formats() API to get more format options.
