@@ -26,6 +26,9 @@ extern "C" {
 #define OV5647_MIPI_CSI_LINE_RATE_1920x1080_30FPS  (OV5647_IDI_CLOCK_RATE_1920x1080_30FPS * 5)
 #define OV5647_IDI_CLOCK_RATE_1280x960_45FPS        (88333333ULL)
 #define OV5647_MIPI_CSI_LINE_RATE_1280x960_45FPS    (OV5647_IDI_CLOCK_RATE_1280x960_45FPS * 5)
+#define OV5647_IDI_CLOCK_RATE_800x640_15FPS        (81666700ULL)
+#define OV5647_MIPI_CSI_LINE_RATE_800x640_15FPS    (OV5647_IDI_CLOCK_RATE_800x640_15FPS * 4)
+
 #define OV5647_8BIT_MODE                           (0x18)
 #define OV5647_10BIT_MODE                          (0x1A)
 #define OV5647_MIPI_CTRL00_CLOCK_LANE_GATE         BIT(5)
@@ -33,8 +36,6 @@ extern "C" {
 #define OV5647_MIPI_CTRL00_BUS_IDLE                BIT(2)
 #define OV5647_MIPI_CTRL00_CLOCK_LANE_DISABLE      BIT(0)
 
-#define OV5647_IDI_CLOCK_RATE_800x640_15FPS        (150000000ULL)
-#define OV5647_MIPI_CSI_LINE_RATE_800x640_15FPS    (OV5647_IDI_CLOCK_RATE_800x640_15FPS * 4)
 
 
 static const ov5647_reginfo_t ov5647_mipi_reset_regs[] = {
@@ -201,13 +202,13 @@ static const ov5647_reginfo_t ov5647_input_24M_MIPI_2lane_raw8_800x640_15fps[] =
 
     // ---------- timing base ----------
     // HTS = 1896 (mesmo dos presets 800×640/800×800)
-    {0x380c, (1896 >> 8) & 0x1F},
-    {0x380d,  1896       & 0xFF},
+    {0x380c, 0x07}, // HTS high byte
+    {0x380d, 0x68},       // HTS low byte
 
     // VTS para ~15 fps com PCLK≈100 MHz:
     // VTS ≈ 100e6 / (1896 * 15) = 3516 = 0x0DBC
-    {0x380e, 0x0D},
-    {0x380f, 0xBC},
+    {0x380e, 0x07},
+    {0x380f, 0x24},
 
     // ---------- Exposição/Ganho ----------
     // Usa auto-exposição/auto-ganho para não ficar subexposto a 15 fps

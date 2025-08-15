@@ -82,8 +82,8 @@ static const esp_cam_sensor_isp_info_t ov5647_isp_info[] = {
 	{
         .isp_v1_info = {
             .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
-            .pclk = 100000000,                  
-            .vts = 3516,                       
+            .pclk = 81666700,                  
+            .vts = 2872,                       
             .hts = 1896,                       
             .bayer_type = ESP_CAM_SENSOR_BAYER_GBRG, 
         }
