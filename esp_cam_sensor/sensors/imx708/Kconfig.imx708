@@ -1,0 +1,118 @@
+menuconfig CAMERA_IMX708
+    bool "IMX708"
+    default n
+    depends on SOC_MIPI_CSI_SUPPORTED
+    help
+        Enable support for the Sony IMX708 CMOS image sensor.
+
+if CAMERA_IMX708
+    menu "Auto detect IMX708"
+        config CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR
+            bool "Detect for MIPI CSI interface sensor"
+            default y
+            help
+                When enabled, the IMX708 sensor will be automatically detected
+                and initialized on the MIPI CSI interface at startup without requiring
+                manual detection call(imx708_detect) in your application.
+    endmenu
+
+    choice CAMERA_IMX708_MIPI_DEFAULT_FMT
+        prompt "Select default output format for MIPI CSI interface"
+        default CAMERA_IMX708_MIPI_RAW10_4608X2592_15FPS
+        help
+            This option allows you to select the default video format for the IMX708 sensor
+            when it is initialized on the MIPI CSI interface. The selected format will be used
+            when the sensor is detected and initialized, and can be changed later when the
+            sensor is in stream off state.
+
+        config CAMERA_IMX708_MIPI_RAW10_4608X2592_15FPS
+            bool "RAW10 4608x2592 15fps, MIPI 2-lane, 24M input"
+            help
+                RAW10 color format at 4608x2592 resolution (full resolution) with 15fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+
+        config CAMERA_IMX708_MIPI_RAW10_2304X1296_30FPS
+            bool "RAW10 2304x1296 30fps, MIPI 2-lane, 24M input"
+            help
+                RAW10 color format at 2304x1296 resolution (2x2 binned) with 30fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+
+        config CAMERA_IMX708_MIPI_RAW10_1280X720_60FPS
+            bool "RAW10 1280x720 60fps, MIPI 2-lane, 24M input"
+            help
+                RAW10 color format at 1280x720 resolution (HD) with 60fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+
+        config CAMERA_IMX708_MIPI_RAW10_800X640_15FPS
+            bool "RAW10 800x640 15fps, MIPI 2-lane, 24M input"
+            help
+                RAW10 color format at 800x640 resolution (custom VGA+) with 15fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+
+        config CAMERA_IMX708_MIPI_RAW8_2304X1296_45FPS
+            bool "RAW8 2304x1296 45fps, MIPI 2-lane, 24M input"
+            help
+                RAW8 color format at 2304x1296 resolution (2x2 binned) with 45fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+
+        config CAMERA_IMX708_MIPI_RAW8_1280X720_90FPS
+            bool "RAW8 1280x720 90fps, MIPI 2-lane, 24M input"
+            help
+                RAW8 color format at 1280x720 resolution (HD) with 90fps framerate.
+                Requires MIPI CSI-2 2-lane interface with 24MHz input clock.
+    endchoice
+
+    choice CAMERA_IMX708_MIPI_LINK_FREQ
+        prompt "Select MIPI link frequency"
+        default CAMERA_IMX708_MIPI_LINK_FREQ_450MHZ
+        help
+            Select the MIPI CSI-2 link frequency for the IMX708 sensor.
+
+        config CAMERA_IMX708_MIPI_LINK_FREQ_447MHZ
+            bool "447 MHz"
+            help
+                Use 447 MHz MIPI link frequency.
+
+        config CAMERA_IMX708_MIPI_LINK_FREQ_450MHZ
+            bool "450 MHz"
+            help
+                Use 450 MHz MIPI link frequency (default).
+
+        config CAMERA_IMX708_MIPI_LINK_FREQ_453MHZ
+            bool "453 MHz"
+            help
+                Use 453 MHz MIPI link frequency.
+    endchoice
+
+    config CAMERA_IMX708_QBC_ADJUST
+        int "Quad Bayer broken line correction strength"
+        range 0 5
+        default 2
+        help
+            Parameter to adjust Quad Bayer re-mosaic broken line correction
+            strength, used in full-resolution mode only. Set zero to disable.
+            Valid range is 0-5, where 0 disables correction and 2-5 are valid
+            correction strengths.
+
+    config CAMERA_IMX708_ENABLE_HDR
+        bool "Enable HDR mode support"
+        default n
+        help
+            Enable High Dynamic Range (HDR) mode support for the IMX708 sensor.
+            HDR mode captures multiple exposures to extend the dynamic range.
+
+    config CAMERA_IMX708_ENABLE_PDAF
+        bool "Enable PDAF support"
+        default y
+        help
+            Enable Phase Detection Auto Focus (PDAF) support for the IMX708 sensor.
+            PDAF provides faster and more accurate autofocus capabilities.
+
+    config CAMERA_IMX708_MAX_SUPPORT
+        int "Maximum number of IMX708 sensors"
+        range 1 2
+        default 1
+        help
+            Maximum number of IMX708 sensors that can be supported simultaneously.
+
+endif # CAMERA_IMX708
