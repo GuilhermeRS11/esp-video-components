@@ -273,18 +273,18 @@ static const imx708_reginfo_t imx708_1280x720_regs[] = {
 
 /* Custom 800x640 @ 15fps configuration */
 static const imx708_reginfo_t imx708_800x640_regs[] = {
-    {0x0342, 0x3D},  // LINE_LENGTH_PCK - Adjusted for 15fps
-    {0x0343, 0x20},
-    {0x0340, 0x08},  // FRM_LENGTH_LINES - Adjusted for 15fps
-    {0x0341, 0x00},
-    {0x0344, 0x03},  // X_ADDR_START - Centered crop for 800px
-    {0x0345, 0x20},
-    {0x0346, 0x02},  // Y_ADDR_START - Centered crop for 640px
-    {0x0347, 0x40},
-    {0x0348, 0x0E},  // X_ADDR_END
-    {0x0349, 0xDF},
-    {0x034A, 0x07},  // Y_ADDR_END
-    {0x034B, 0xBF},
+    {0x0342, 0x2F},  // LINE_LENGTH_PCK - Adjusted for centered crop: 12000
+    {0x0343, 0x00},
+    {0x0340, 0x04},  // FRM_LENGTH_LINES - Adjusted for 15fps: 1013  
+    {0x0341, 0xF5},
+    {0x0344, 0x05},  // X_ADDR_START - Centered crop start: 1504
+    {0x0345, 0xE0},
+    {0x0346, 0x02},  // Y_ADDR_START - Centered crop start: 656  
+    {0x0347, 0x90},
+    {0x0348, 0x0C},  // X_ADDR_END - Centered crop end: 3103
+    {0x0349, 0x1F},
+    {0x034A, 0x07},  // Y_ADDR_END - Centered crop end: 1935
+    {0x034B, 0x8F},
     {0x0220, 0x62},
     {0x0222, 0x01},
     {0x0900, 0x01},  // BINNING_MODE

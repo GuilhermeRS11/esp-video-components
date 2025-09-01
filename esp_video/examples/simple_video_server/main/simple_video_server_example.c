@@ -27,6 +27,7 @@
 #include "lwip/inet.h"
 #include "lwip/apps/netbiosns.h"
 #include "example_video_common.h"
+#include "shell.h"
 
 #define EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER  CONFIG_EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER
 
@@ -796,6 +797,9 @@ void app_main(void)
     ESP_ERROR_CHECK(example_connect());
 
     ESP_ERROR_CHECK(example_video_init());
+
+    // Start shell task for camera control
+    xTaskCreate(shell_task, "shell_task", 4096, NULL, 5, NULL);
 
     web_cam_video_config_t config[] = {
 #if EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR

@@ -33,7 +33,7 @@ extern "C" {
 /* Exposure control */
 #define IMX708_REG_EXPOSURE         0x0202
 #define IMX708_EXPOSURE_OFFSET      48
-#define IMX708_EXPOSURE_DEFAULT     0x640
+#define IMX708_EXPOSURE_DEFAULT     98     // 98 lines to match V4L2 step requirements
 #define IMX708_EXPOSURE_STEP        1
 #define IMX708_EXPOSURE_MIN         1
 #define IMX708_EXPOSURE_MAX         (IMX708_FRAME_LENGTH_MAX - IMX708_EXPOSURE_OFFSET)
@@ -51,6 +51,14 @@ extern "C" {
 #define IMX708_DGTL_GAIN_MAX        0xffff
 #define IMX708_DGTL_GAIN_DEFAULT    0x0100
 #define IMX708_DGTL_GAIN_STEP       1
+
+/* Color balance controls */
+#define IMX708_REG_COLOUR_BALANCE_RED   0x0b90
+#define IMX708_REG_COLOUR_BALANCE_BLUE  0x0b92
+#define IMX708_COLOUR_BALANCE_MIN       0x01
+#define IMX708_COLOUR_BALANCE_MAX       0xffff
+#define IMX708_COLOUR_BALANCE_STEP      0x01
+#define IMX708_COLOUR_BALANCE_DEFAULT   0x100
 
 /* Color balance controls */
 #define IMX708_REG_COLOUR_BALANCE_RED   0x0b90

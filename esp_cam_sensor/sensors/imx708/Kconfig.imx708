@@ -115,4 +115,50 @@ if CAMERA_IMX708
         help
             Maximum number of IMX708 sensors that can be supported simultaneously.
 
+    choice CAMERA_IMX708_IPA_JSON_CONFIGURATION_FILE
+        prompt "IPA Configuration File"
+        default CAMERA_IMX708_DEFAULT_IPA_JSON_CONFIGURATION_FILE
+        help
+            Select the Image Processing Algorithm (IPA) JSON configuration file
+            for the IMX708 sensor.
+
+        config CAMERA_IMX708_DEFAULT_IPA_JSON_CONFIGURATION_FILE
+            bool "Use default configuration"
+            help
+                Use the built-in default IPA configuration file:
+                "esp_cam_sensor/sensors/imx708/cfg/imx708_default.json"
+
+                This configuration provides optimized settings for general use cases
+                including auto white balance (AWB), auto color correction (ACC),
+                auto exposure enhancement (AEN), auto denoise (ADN), and image
+                analysis (IAN) algorithms.
+
+                Recommended for most applications.
+
+        config CAMERA_IMX708_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE
+            bool "Use custom configuration"
+            help
+                Use a custom IPA configuration file with your own optimized settings.
+
+                This option allows you to fine-tune sensor parameters for specific
+                lighting conditions, color requirements, or application needs.
+
+                You must specify the custom file path in the configuration below.
+    endchoice
+
+    config CAMERA_IMX708_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH
+        string "Custom IPA configuration file path"
+        default ""
+        depends on CAMERA_IMX708_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE
+        help
+            Specify the path to your custom IMX708 IPA JSON configuration file.
+
+            The path is relative to your project root directory.
+
+            Example: "components/my_camera_config/imx708_custom.json"
+
+            Ensure the file exists and contains valid JSON configuration
+            parameters compatible with the IMX708 sensor including AWB, ACC,
+            AEN, ADN, and IAN algorithm configurations.
+
 endif # CAMERA_IMX708

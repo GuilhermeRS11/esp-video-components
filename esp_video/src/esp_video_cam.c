@@ -12,6 +12,10 @@
 #include "esp_video_ioctl.h"
 #include "esp_video_cam.h"
 
+// IMX708 custom control IDs (same as defined in imx708.c)
+#define IMX708_COLOR_BALANCE_RED    ESP_CAM_SENSOR_CLASS_ID(ESP_CAM_SENSOR_CID_CLASS_USER, 0x0100)
+#define IMX708_COLOR_BALANCE_BLUE   ESP_CAM_SENSOR_CLASS_ID(ESP_CAM_SENSOR_CID_CLASS_USER, 0x0101)
+
 struct control_map {
     uint32_t esp_cam_priv_id;
     uint32_t v4l2_id;
@@ -74,12 +78,33 @@ static const struct control_map s_sensor_control_map_table[] = {
         .esp_cam_priv_id = ESP_CAM_SENSOR_HMIRROR,
         .v4l2_id = V4L2_CID_HFLIP,
     },
+    // IMX708 Custom Color Balance Controls
+    {
+        .esp_cam_priv_id = IMX708_COLOR_BALANCE_RED,
+        .v4l2_id = V4L2_CID_RED_BALANCE,
+    },
+    {
+        .esp_cam_priv_id = IMX708_COLOR_BALANCE_BLUE,
+        .v4l2_id = V4L2_CID_BLUE_BALANCE,
+    },
 };
 
 static const struct control_map s_sensor_control_ioctl_table[] = {
     {
         .esp_cam_priv_id = ESP_CAM_SENSOR_IOC_S_TEST_PATTERN,
         .v4l2_id = V4L2_CID_TEST_PATTERN,
+    },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_IOC_S_BRIGHTNESS,
+        .v4l2_id = V4L2_CID_BRIGHTNESS,
+    },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_IOC_S_CONTRAST,
+        .v4l2_id = V4L2_CID_CONTRAST,
+    },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_IOC_S_SATURATION,
+        .v4l2_id = V4L2_CID_SATURATION,
     },
 };
 
@@ -109,8 +134,12 @@ static const struct control_map s_motor_control_map_table[] = {
  */
 static const struct control_map *get_v4l2_ext_control_map(uint32_t v4l2_id, bool *ioctl, cam_dev_type_t *type)
 {
+    ESP_LOGI("esp_video_cam", "Looking for V4L2 ID: 0x%08lx", v4l2_id);
+    
     for (int i = 0; i < ARRAY_SIZE(s_sensor_control_map_table); i++) {
         if (s_sensor_control_map_table[i].v4l2_id == v4l2_id) {
+            ESP_LOGI("esp_video_cam", "Found mapping: V4L2 0x%08lx -> ESP 0x%08lx", 
+                     v4l2_id, s_sensor_control_map_table[i].esp_cam_priv_id);
             *ioctl = false;
             *type = CAM_DEV_SENSOR;
             return &s_sensor_control_map_table[i];
@@ -135,6 +164,7 @@ static const struct control_map *get_v4l2_ext_control_map(uint32_t v4l2_id, bool
         }
     }
 
+    ESP_LOGW("esp_video_cam", "No mapping found for V4L2 ID: 0x%08lx", v4l2_id);
     return NULL;
 }
 
@@ -211,6 +241,13 @@ static esp_err_t get_opt_value_desc(esp_video_cam_t *cam, struct v4l2_ext_contro
     } else {
         switch (qdesc->id) {
         case ESP_CAM_SENSOR_IOC_S_TEST_PATTERN: {
+            *buf_ptr = &ctrl->value;
+            *buf_size = sizeof(ctrl->value);
+            break;
+        }
+        case ESP_CAM_SENSOR_IOC_S_BRIGHTNESS:
+        case ESP_CAM_SENSOR_IOC_S_CONTRAST:
+        case ESP_CAM_SENSOR_IOC_S_SATURATION: {
             *buf_ptr = &ctrl->value;
             *buf_size = sizeof(ctrl->value);
             break;
