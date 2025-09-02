@@ -78,6 +78,10 @@ static const struct control_map s_sensor_control_map_table[] = {
         .esp_cam_priv_id = ESP_CAM_SENSOR_HMIRROR,
         .v4l2_id = V4L2_CID_HFLIP,
     },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_AWB,
+        .v4l2_id = V4L2_CID_AUTO_WHITE_BALANCE,
+    },
     // IMX708 Custom Color Balance Controls
     {
         .esp_cam_priv_id = IMX708_COLOR_BALANCE_RED,

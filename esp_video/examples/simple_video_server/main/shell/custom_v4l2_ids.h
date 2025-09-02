@@ -11,10 +11,8 @@
 extern "C" {
 #endif
 
-// Custom V4L2 IDs for IMX708 color balance controls
-// Using V4L2_CID_PRIVATE_BASE as starting point for custom controls
-#define V4L2_CID_RED_BALANCE    (V4L2_CID_PRIVATE_BASE + 0x100)    /*!< Red color balance gain control */
-#define V4L2_CID_BLUE_BALANCE   (V4L2_CID_PRIVATE_BASE + 0x101)    /*!< Blue color balance gain control */
+// Note: V4L2_CID_RED_BALANCE and V4L2_CID_BLUE_BALANCE are already defined in standard V4L2
+// so we don't need to redefine them here. They map to standard color balance controls.
 
 #ifdef __cplusplus
 }

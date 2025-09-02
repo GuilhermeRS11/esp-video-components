@@ -1574,11 +1574,27 @@ static esp_err_t imx708_set_format(esp_cam_sensor_device_t *dev, const esp_cam_s
         ret |= imx708_write(dev->sccb_handle, 0x3201, 0x01);  // AWB control enable
         ret |= imx708_write(dev->sccb_handle, 0x3202, 0x01);  // AWB gain control enable
         
-        // Enable automatic color correction matrix
+        // Configure AWB sensitivity and responsiveness for better low-light performance
+        ret |= imx708_write(dev->sccb_handle, 0x3203, 0x40);  // AWB speed control (slower convergence)
+        ret |= imx708_write(dev->sccb_handle, 0x3204, 0x20);  // AWB stability threshold
+        ret |= imx708_write(dev->sccb_handle, 0x3205, 0x80);  // AWB low-light sensitivity
+        ret |= imx708_write(dev->sccb_handle, 0x3206, 0x06);  // AWB gain step size (smaller steps)
+        
+        // Set AWB gain limits to prevent overcorrection
+        ret |= imx708_write(dev->sccb_handle, 0x3207, 0x80);  // Red gain min (0.5x)
+        ret |= imx708_write(dev->sccb_handle, 0x3208, 0xFF);  // Red gain max (2.0x)
+        ret |= imx708_write(dev->sccb_handle, 0x3209, 0x80);  // Blue gain min (0.5x)
+        ret |= imx708_write(dev->sccb_handle, 0x320A, 0xFF);  // Blue gain max (2.0x)
+        
+        // Enable automatic color correction matrix with improved low-light handling
         ret |= imx708_write(dev->sccb_handle, 0x0B8E, 0x01);  // Enable auto color correction
         ret |= imx708_write(dev->sccb_handle, 0x0B8F, 0x01);  // Color correction control
         ret |= imx708_write(dev->sccb_handle, 0x0B94, 0x01);  // Enable additional auto correction
         ret |= imx708_write(dev->sccb_handle, 0x0B95, 0x00);  // Auto correction mode
+        
+        // Configure low-light color correction bias to reduce green tint
+        ret |= imx708_write(dev->sccb_handle, 0x0B96, 0x90);  // Low-light red bias (increase red)
+        ret |= imx708_write(dev->sccb_handle, 0x0B97, 0x70);  // Low-light blue bias (reduce blue slightly)
         
         // Note: Manual color balance can still be controlled via V4L2 commands:
         // - cam_red_balance [100-2000] for red gain adjustment
@@ -1890,6 +1906,66 @@ err_free_handler:
     return NULL;
 }
 
+// Global reference to the IMX708 device for hardware register access
+static esp_cam_sensor_device_t *g_imx708_device = NULL;
+
+/**
+ * @brief Set global IMX708 device reference for hardware access
+ * This function should be called after successful device detection
+ */
+void imx708_set_global_device(esp_cam_sensor_device_t *device)
+{
+    g_imx708_device = device;
+    ESP_LOGI(TAG, "IMX708 global device reference set for hardware access");
+}
+
+/**
+ * @brief Public function to write IMX708 hardware registers
+ * Provides shell command access to direct register control
+ */
+esp_err_t imx708_hw_write_register(uint16_t reg, uint8_t value)
+{
+    if (!g_imx708_device || !g_imx708_device->sccb_handle) {
+        ESP_LOGE(TAG, "IMX708 device not initialized for hardware access");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    esp_err_t ret = imx708_write(g_imx708_device->sccb_handle, reg, value);
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG, "IMX708 HW Write: 0x%04X = 0x%02X", reg, value);
+    } else {
+        ESP_LOGE(TAG, "IMX708 HW Write failed: 0x%04X = 0x%02X, error: %s", reg, value, esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
+/**
+ * @brief Public function to read IMX708 hardware registers
+ * Provides shell command access to direct register monitoring
+ */
+esp_err_t imx708_hw_read_register(uint16_t reg, uint8_t *value)
+{
+    if (!g_imx708_device || !g_imx708_device->sccb_handle) {
+        ESP_LOGE(TAG, "IMX708 device not initialized for hardware access");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (!value) {
+        ESP_LOGE(TAG, "IMX708 HW Read: NULL value pointer");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    esp_err_t ret = imx708_read(g_imx708_device->sccb_handle, reg, value);
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG, "IMX708 HW Read: 0x%04X = 0x%02X", reg, *value);
+    } else {
+        ESP_LOGE(TAG, "IMX708 HW Read failed: 0x%04X, error: %s", reg, esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
 #if CONFIG_CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR
 ESP_CAM_SENSOR_DETECT_FN(imx708_detect, ESP_CAM_SENSOR_MIPI_CSI, IMX708_SCCB_ADDR)
 {
@@ -1902,6 +1978,9 @@ ESP_CAM_SENSOR_DETECT_FN(imx708_detect, ESP_CAM_SENSOR_MIPI_CSI, IMX708_SCCB_ADD
     esp_cam_sensor_device_t *result = imx708_detect(config);
     if (result) {
         ESP_LOGI(TAG, "IMX708 auto-detect: Detection successful!");
+        // Set global device reference for hardware register access
+        imx708_set_global_device(result);
+        ESP_LOGI(TAG, "IMX708 auto-detect: Global device reference configured for hardware access");
     } else {
         ESP_LOGE(TAG, "IMX708 auto-detect: Detection failed!");
     }

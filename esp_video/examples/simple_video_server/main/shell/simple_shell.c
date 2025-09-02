@@ -19,6 +19,7 @@
 #include "nvs_flash.h"
 #include "simple_shell.h"
 #include "camera_shell.h"
+#include "imx708_hardware_shell.h"
 
 static const char* TAG = "simple_shell";
 
@@ -255,12 +256,15 @@ void simple_shell_start(void)
     // Register camera control commands
     camera_shell_register_commands();
     
+    // Register IMX708 hardware register control commands
+    imx708_hardware_shell_register_commands();
+    
     shell_running = true;
     
     // Start console task
     xTaskCreate(console_task, "console", 4096, NULL, 5, NULL);
     
-    ESP_LOGI(TAG, "📟 Shell console started successfully!");
+    ESP_LOGI(TAG, "Shell console started successfully!");
 }
 
 /**
