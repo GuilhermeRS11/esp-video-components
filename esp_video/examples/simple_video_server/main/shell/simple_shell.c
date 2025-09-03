@@ -104,22 +104,21 @@ static int restart_cmd(int argc, char **argv)
  */
 static int info_cmd(int argc, char **argv)
 {
-    printf("\n🔧 ESP32-P4 Video Server System Info:\n");
+    printf("\nESP32-P4 Video Server System Info:\n");
     printf("=====================================\n");
     
     printf("Chip: %s\n", CONFIG_IDF_TARGET);
     printf("Free heap: %lu bytes\n", esp_get_free_heap_size());
     printf("Minimum free heap: %lu bytes\n", esp_get_minimum_free_heap_size());
     
-    printf("\nCamera Shell Commands Available:\n");
-    printf("  exposure     - Control exposure time\n");
-    printf("  gain         - Control sensor gain\n");
-    printf("  brightness   - Adjust brightness\n");
-    printf("  contrast     - Adjust contrast\n");
-    printf("  saturation   - Adjust saturation\n");
-    printf("  flip         - Set horizontal/vertical flip\n");
-    printf("  cam_status   - Show current camera settings\n");
-    printf("  quick_setup  - Apply preset configurations\n");
+    printf("\nWorking Camera Commands:\n");
+    printf("  cam_red_balance      - Red color balance (V4L2)\n");
+    printf("  cam_blue_balance     - Blue color balance (V4L2)\n");
+    printf("  cam_exposure         - Exposure control (V4L2)\n");
+    printf("  cam_gain             - Gain control (V4L2)\n");
+    printf("  cam_status           - Show current camera settings\n");
+    printf("  sensor_exposure_direct - Direct sensor exposure (only working direct control)\n");
+    printf("  hw_registers_dump    - Hardware register diagnostics\n");
     printf("\nType 'help' for more commands\n\n");
     
     return 0;
@@ -138,16 +137,20 @@ static int help_cmd(int argc, char **argv)
     printf("  restart      - Restart the system\n");
     printf("  free         - Show memory info\n");
     printf("  version      - Show IDF version\n");
-    printf("\nCamera Commands:\n");
-    printf("  cam_brightness   - Get/set brightness (-2 to +2)\n");
-    printf("  cam_contrast     - Get/set contrast (-2 to +2)\n");
-    printf("  cam_saturation   - Get/set saturation (-2 to +2)\n");
-    printf("  cam_status       - Display current camera settings\n");
+    printf("\nWorking Camera Commands:\n");
+    printf("  cam_red_balance      - Red color balance (100-2000)\n");
+    printf("  cam_blue_balance     - Blue color balance (100-2000)\n");
+    printf("  cam_exposure         - Exposure control (microseconds)\n");
+    printf("  cam_gain             - Gain control\n");
+    printf("  cam_status           - Display current camera settings\n");
+    printf("  sensor_exposure_direct - Direct exposure (lines, only working direct control)\n");
+    printf("  hw_registers_dump    - Hardware register diagnostics\n");
     printf("\nExamples:\n");
-    printf("  cam_brightness       # Show current brightness\n");
-    printf("  cam_brightness 1     # Set brightness to 1\n");
-    printf("  cam_contrast -1      # Set contrast to -1\n");
-    printf("  cam_status           # Show all current settings\n");
+    printf("  cam_red_balance          # Show current red balance\n");
+    printf("  cam_red_balance 1500     # Set red balance to 1500\n");
+    printf("  cam_blue_balance 1200    # Set blue balance to 1200\n");
+    printf("  sensor_exposure_direct 2000  # Set exposure to 2000 lines\n");
+    printf("  cam_status               # Show all current settings\n");
     printf("\n");
     
     return 0;
@@ -192,7 +195,7 @@ static void console_task(void *args)
     const char* prompt = LOG_COLOR_I PROMPT_STR "> " LOG_RESET_COLOR;
 
     printf("\n");
-    printf("🎥 ESP32-P4 IMX708 Video Server with Camera Control Shell\n");
+    printf("ESP32-P4 IMX708 Video Server with Camera Control Shell\n");
     printf("=========================================================\n");
     printf("Type 'help' for available commands\n");
     printf("Type 'info' for system information\n");

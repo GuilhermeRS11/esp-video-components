@@ -78,75 +78,76 @@
         },
         "awb": {
             "model": 0,
-            "min_counted": 800,
-            "min_red_gain_step": 0.01,
-            "min_blue_gain_step": 0.01,
+            "min_counted": 1200,
+            "min_red_gain_step": 0.03,
+            "min_blue_gain_step": 0.03,
             "range": {
                 "green": {
-                    "max": 220,
-                    "min": 180
+                    "max": 210,
+                    "min": 190
                 },
                 "rg": {
-                    "max": 0.8899,
-                    "min": 0.5040
+                    "max": 0.8500,
+                    "min": 0.5200
                 },
                 "bg": {
-                    "max": 0.7822,
-                    "min": 0.4838
+                    "max": 0.7500,
+                    "min": 0.5000
                 }
             },
             "green_luma_env": "ae.luma.avg",
             "green_luma_init": 200,
-            "green_luma_step_ratio": 0.3,
+            "green_luma_step_ratio": 0.15,
             "bayes": true,
-            "convergence_tolerance": 0.005,
-            "speed": 0.4,
+            "convergence_tolerance": 0.02,
+            "speed": 0.15,
+            "temporal_stability": 25,
             "white_points": [
                 {
                     "color_temp": 2856,
-                    "r": 1.55,
-                    "b": 2.25
+                    "r": 1.45,
+                    "b": 2.15
                 },
                 {
                     "color_temp": 3200,
-                    "r": 1.35,
-                    "b": 1.95
+                    "r": 1.30,
+                    "b": 1.85
                 },
                 {
                     "color_temp": 4000,
-                    "r": 1.15,
-                    "b": 1.75
+                    "r": 1.12,
+                    "b": 1.68
                 },
                 {
                     "color_temp": 5000,
-                    "r": 0.95,
-                    "b": 1.55
+                    "r": 0.98,
+                    "b": 1.52
                 },
                 {
                     "color_temp": 6500,
-                    "r": 0.75,
-                    "b": 1.35
+                    "r": 0.82,
+                    "b": 1.32
                 },
                 {
                     "color_temp": 8000,
-                    "r": 0.65,
-                    "b": 1.15
+                    "r": 0.72,
+                    "b": 1.18
                 }
             ],
             "sensitivity": {
                 "r": {
-                    "max": 0.85,
-                    "min": 0.45
+                    "max": 0.75,
+                    "min": 0.55
                 },
                 "b": {
-                    "max": 0.80,
-                    "min": 0.40
+                    "max": 0.70,
+                    "min": 0.50
                 }
             },
             "target": {
                 "color_temp": 6500,
-                "r": 0.75,
-                "b": 1.35
+                "r": 0.82,
+                "b": 1.32
             }
         },
         "acc": {

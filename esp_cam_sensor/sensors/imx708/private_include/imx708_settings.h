@@ -221,11 +221,11 @@ static const imx708_reginfo_t imx708_1280x720_regs[] = {
     {0x0343, 0xC4},
     {0x0340, 0x05},  // FRM_LENGTH_LINES
     {0x0341, 0xDC},
-    {0x0344, 0x02},  // X_ADDR_START (cropped)
+    {0x0344, 0x06},  // X_ADDR_START (fine adjustment right)
     {0x0345, 0x00},
-    {0x0346, 0x01},  // Y_ADDR_START (cropped)
+    {0x0346, 0x01},  // Y_ADDR_START (centered crop)
     {0x0347, 0x68},
-    {0x0348, 0x0F},  // X_ADDR_END
+    {0x0348, 0x0F},  // X_ADDR_END (fine adjustment right)
     {0x0349, 0xFF},
     {0x034A, 0x08},  // Y_ADDR_END
     {0x034B, 0xB7},

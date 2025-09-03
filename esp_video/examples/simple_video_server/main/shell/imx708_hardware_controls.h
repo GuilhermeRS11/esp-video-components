@@ -22,6 +22,9 @@
 #define IMX708_REG_AE_MIN_GAIN          0x3104  // Minimum gain limit
 #define IMX708_REG_AE_MAX_GAIN          0x3105  // Maximum gain limit
 
+// Auto Gain Control (AGC)
+#define IMX708_REG_AGC_ENABLE           0x3110  // Enable/disable AGC algorithm
+
 // Noise Reduction Controls
 #define IMX708_REG_NR_ENABLE            0x3500  // Enable noise reduction
 #define IMX708_REG_NR_STRENGTH          0x3501  // NR strength (0x10-0x80)

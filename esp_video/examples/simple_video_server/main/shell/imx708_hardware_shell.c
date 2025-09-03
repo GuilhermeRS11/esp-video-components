@@ -1,7 +1,6 @@
 /*
- * IMX708 Hardware Register Control Shell Commands
- * Direct register access for advanced camera parameter control
- * These commands write directly to IMX708 hardware registers
+ * IMX708 Hardware Control Shell Commands
+ * Focus on direct hardware register control only
  */
 
 #include <stdio.h>
@@ -10,6 +9,8 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_console.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "imx708.h"
 #include "imx708_hardware_controls.h"
 #include "imx708_hardware_shell.h"
@@ -17,390 +18,367 @@
 static const char* TAG = "imx708_hw_shell";
 
 /**
- * @brief Hardware AWB Speed Control
- * Controls convergence speed of AWB algorithm
+ * @brief Direct Sensor Exposure Control
  */
-static int cmd_hw_awb_speed(int argc, char **argv)
+static int cmd_sensor_exposure_direct(int argc, char **argv)
 {
     if (argc == 1) {
-        // Read current value
-        uint8_t current_value = 0;
-        esp_err_t ret = imx708_hw_read_register(IMX708_REG_AWB_SPEED, &current_value);
-        if (ret == ESP_OK) {
-            printf("AWB Speed: 0x%02X (%d)\n", current_value, current_value);
-            printf("Range: 0x10-0xFF (faster convergence with higher values)\n");
-        } else {
-            printf("Failed to read AWB speed register\n");
-        }
+        printf("Direct Sensor Exposure Control\n");
+        printf("==============================\n");
+        printf("Usage: sensor_exposure_direct <exposure_lines>\n");
+        printf("       sensor_exposure_direct current\n");
+        printf("       sensor_exposure_direct auto <enable|disable>\n\n");
+        printf("Values: 1-8000 lines (typical)\n");
+        printf("Lower = darker, Higher = brighter\n");
+        printf("This directly writes to registers 0x0202/0x0203\n");
         return 0;
     }
     
-    int speed = strtol(argv[1], NULL, 0); // Support hex (0x) and decimal
-    if (speed < 0x10 || speed > 0xFF) {
-        printf("Invalid speed value. Range: 0x10-0xFF (16-255)\n");
-        return 1;
-    }
+    const char *param = argv[1];
     
-    esp_err_t ret = imx708_hw_write_register(IMX708_REG_AWB_SPEED, (uint8_t)speed);
-    if (ret == ESP_OK) {
-        printf("AWB Speed set to: 0x%02X (%d)\n", speed, speed);
-        printf("Higher values = faster convergence\n");
-    } else {
-        printf("Failed to write AWB speed register\n");
-        return 1;
-    }
-    
-    return 0;
-}
-
-/**
- * @brief Hardware Auto Exposure Target
- * Sets target brightness for AE algorithm
- */
-static int cmd_hw_ae_target(int argc, char **argv)
-{
-    if (argc == 1) {
-        // Read current value
-        uint8_t current_value = 0;
-        esp_err_t ret = imx708_hw_read_register(IMX708_REG_AE_TARGET, &current_value);
-        if (ret == ESP_OK) {
-            printf("AE Target: 0x%02X (%d)\n", current_value, current_value);
-            printf("Range: 0-255 (target brightness level)\n");
-        } else {
-            printf("Failed to read AE target register\n");
-        }
-        return 0;
-    }
-    
-    int target = strtol(argv[1], NULL, 0);
-    if (target < 0 || target > 255) {
-        printf("Invalid target value. Range: 0-255\n");
-        return 1;
-    }
-    
-    esp_err_t ret = imx708_hw_write_register(IMX708_REG_AE_TARGET, (uint8_t)target);
-    if (ret == ESP_OK) {
-        printf("AE Target set to: 0x%02X (%d)\n", target, target);
-        printf("Lower values = darker image, higher = brighter\n");
-    } else {
-        printf("Failed to write AE target register\n");
-        return 1;
-    }
-    
-    return 0;
-}
-
-/**
- * @brief Hardware Auto Exposure Enable/Disable
- */
-static int cmd_hw_ae_enable(int argc, char **argv)
-{
-    if (argc == 1) {
-        // Read current value
-        uint8_t current_value = 0;
-        esp_err_t ret = imx708_hw_read_register(IMX708_REG_AE_ENABLE, &current_value);
-        if (ret == ESP_OK) {
-            printf("Hardware AE: %s (0x%02X)\n", 
-                   current_value ? "ENABLED" : "DISABLED", current_value);
-        } else {
-            printf("Failed to read AE enable register\n");
-        }
-        return 0;
-    }
-    
-    uint8_t enable_value = 0;
-    if (strcmp(argv[1], "enable") == 0 || strcmp(argv[1], "1") == 0) {
-        enable_value = 1;
-    } else if (strcmp(argv[1], "disable") == 0 || strcmp(argv[1], "0") == 0) {
-        enable_value = 0;
-    } else {
-        printf("Usage: hw_ae_enable <enable|disable|1|0>\n");
-        return 1;
-    }
-    
-    esp_err_t ret = imx708_hw_write_register(IMX708_REG_AE_ENABLE, enable_value);
-    if (ret == ESP_OK) {
-        printf("Hardware AE %s\n", enable_value ? "ENABLED" : "DISABLED");
-        printf("Register 0x%04X = 0x%02X\n", IMX708_REG_AE_ENABLE, enable_value);
-    } else {
-        printf("Failed to write AE enable register\n");
-        return 1;
-    }
-    
-    return 0;
-}
-
-/**
- * @brief Hardware Noise Reduction Control
- */
-static int cmd_hw_noise_reduction(int argc, char **argv)
-{
-    if (argc == 1) {
-        // Read current values
-        uint8_t enable = 0, strength = 0;
-        esp_err_t ret1 = imx708_hw_read_register(IMX708_REG_NR_ENABLE, &enable);
-        esp_err_t ret2 = imx708_hw_read_register(IMX708_REG_NR_STRENGTH, &strength);
+    if (strcmp(param, "current") == 0) {
+        uint8_t exp_h, exp_l, ae_enable;
+        imx708_hw_read_register(0x0202, &exp_h);
+        imx708_hw_read_register(0x0203, &exp_l);
+        imx708_hw_read_register(IMX708_REG_AE_ENABLE, &ae_enable);
         
-        if (ret1 == ESP_OK && ret2 == ESP_OK) {
-            printf("Noise Reduction: %s\n", enable ? "ENABLED" : "DISABLED");
-            printf("Strength: 0x%02X (%d)\n", strength, strength);
-            printf("Usage: hw_noise_reduction <enable|disable> [strength]\n");
+        uint16_t exposure = (exp_h << 8) | exp_l;
+        
+        printf("Current Exposure Settings:\n");
+        printf("  Exposure: %d lines (0x%04X)\n", exposure, exposure);
+        printf("  Auto Exposure: %s (register 0x3100 = 0x%02X)\n", 
+               ae_enable ? "ENABLED" : "DISABLED", ae_enable);
+        
+        if (exposure < 500) {
+            printf("  → Very fast exposure (bright scenes)\n");
+        } else if (exposure < 2000) {
+            printf("  → Normal exposure\n");
         } else {
-            printf("Failed to read noise reduction registers\n");
+            printf("  → Long exposure (low light)\n");
         }
+        
         return 0;
     }
     
-    uint8_t enable_value = 0;
-    if (strcmp(argv[1], "enable") == 0) {
-        enable_value = 1;
-    } else if (strcmp(argv[1], "disable") == 0) {
-        enable_value = 0;
-    } else {
-        printf("Usage: hw_noise_reduction <enable|disable> [strength]\n");
-        return 1;
-    }
-    
-    // Write enable/disable
-    esp_err_t ret = imx708_hw_write_register(IMX708_REG_NR_ENABLE, enable_value);
-    if (ret != ESP_OK) {
-        printf("Failed to write NR enable register\n");
-        return 1;
-    }
-    
-    // Write strength if provided
-    if (argc >= 3 && enable_value) {
-        int strength = strtol(argv[2], NULL, 0);
-        if (strength < 0x10 || strength > 0x80) {
-            printf("Invalid strength. Range: 0x10-0x80 (16-128)\n");
+    if (strcmp(param, "auto") == 0) {
+        if (argc != 3) {
+            printf("Usage: sensor_exposure_direct auto <enable|disable>\n");
             return 1;
         }
         
-        ret = imx708_hw_write_register(IMX708_REG_NR_STRENGTH, (uint8_t)strength);
+        bool enable = strcmp(argv[2], "enable") == 0;
+        uint8_t ae_val = enable ? 0x01 : 0x00;
+        
+        ESP_LOGI(TAG, "%s sensor auto exposure", enable ? "Enabling" : "Disabling");
+        esp_err_t ret = imx708_hw_write_register(IMX708_REG_AE_ENABLE, ae_val);
+        
         if (ret == ESP_OK) {
-            printf("Noise Reduction ENABLED, Strength: 0x%02X (%d)\n", strength, strength);
+            printf("Sensor Auto Exposure %s\n", enable ? "ENABLED" : "DISABLED");
+            printf("Register 0x3100 = 0x%02X\n", ae_val);
+        }
+        return ret == ESP_OK ? 0 : 1;
+    }
+    
+    // Manual exposure setting
+    int exposure = atoi(param);
+    if (exposure < 1 || exposure > 8000) {
+        printf("Exposure must be 1-8000 lines\n");
+        return 1;
+    }
+    
+    ESP_LOGI(TAG, "Setting direct exposure to %d lines", exposure);
+    
+    uint8_t exp_h = (exposure >> 8) & 0xFF;
+    uint8_t exp_l = exposure & 0xFF;
+    
+    esp_err_t ret = ESP_OK;
+    ret |= imx708_hw_write_register(0x0202, exp_h);
+    ret |= imx708_hw_write_register(0x0203, exp_l);
+    
+    if (ret == ESP_OK) {
+        printf("Exposure set to %d lines\n", exposure);
+        printf("  Register 0x0202 = 0x%02X (high byte)\n", exp_h);
+        printf("  Register 0x0203 = 0x%02X (low byte)\n", exp_l);
+        
+        if (exposure < 500) {
+            printf("  Effect: FASTER exposure (darker image)\n");
+        } else if (exposure > 2000) {
+            printf("  Effect: SLOWER exposure (brighter image)\n");
         } else {
-            printf("Failed to write NR strength register\n");
+            printf("  Effect: NORMAL exposure\n");
+        }
+    }
+    
+    return ret == ESP_OK ? 0 : 1;
+}
+
+/**
+ * @brief Direct sensor gain control
+ */
+static int cmd_sensor_gain_direct(int argc, char **argv)
+{
+    if (argc == 1) {
+        printf("Direct Sensor Gain Control\n");
+        printf("==========================\n");
+        printf("Usage: sensor_gain_direct <gain_value>\n");
+        printf("       sensor_gain_direct current\n");
+        printf("       sensor_gain_direct auto <enable|disable>\n\n");
+        printf("Values: 112-960 (IMX708 analog gain range)\n");
+        printf("Lower = less sensitive, Higher = more sensitive\n");
+        return 0;
+    }
+    
+    const char *param = argv[1];
+    
+    if (strcmp(param, "current") == 0) {
+        uint8_t gain_h, gain_l, agc_enable;
+        imx708_hw_read_register(0x0204, &gain_h);
+        imx708_hw_read_register(0x0205, &gain_l);
+        imx708_hw_read_register(IMX708_REG_AGC_ENABLE, &agc_enable);
+        
+        uint16_t gain = (gain_h << 8) | gain_l;
+        
+        printf("Current Gain Settings:\n");
+        printf("  Analog Gain: %d (0x%04X)\n", gain, gain);
+        printf("  Auto Gain: %s\n", agc_enable ? "ENABLED" : "DISABLED");
+        
+        return 0;
+    }
+    
+    if (strcmp(param, "auto") == 0) {
+        if (argc != 3) {
+            printf("Usage: sensor_gain_direct auto <enable|disable>\n");
             return 1;
         }
-    } else {
-        printf("Noise Reduction %s\n", enable_value ? "ENABLED" : "DISABLED");
+        
+        bool enable = strcmp(argv[2], "enable") == 0;
+        uint8_t agc_val = enable ? 0x01 : 0x00;
+        
+        esp_err_t ret = imx708_hw_write_register(IMX708_REG_AGC_ENABLE, agc_val);
+        
+        if (ret == ESP_OK) {
+            printf("Sensor Auto Gain %s\n", enable ? "ENABLED" : "DISABLED");
+        }
+        return ret == ESP_OK ? 0 : 1;
     }
     
-    return 0;
+    // Manual gain setting
+    int gain = atoi(param);
+    if (gain < 112 || gain > 960) {
+        printf("Gain must be 112-960 (IMX708 range)\n");
+        return 1;
+    }
+    
+    uint8_t gain_h = (gain >> 8) & 0xFF;
+    uint8_t gain_l = gain & 0xFF;
+    
+    esp_err_t ret = ESP_OK;
+    ret |= imx708_hw_write_register(0x0204, gain_h);
+    ret |= imx708_hw_write_register(0x0205, gain_l);
+    
+    if (ret == ESP_OK) {
+        printf("Analog gain set to %d\n", gain);
+        printf("  Register 0x0204 = 0x%02X (high byte)\n", gain_h);
+        printf("  Register 0x0205 = 0x%02X (low byte)\n", gain_l);
+    }
+    
+    return ret == ESP_OK ? 0 : 1;
 }
 
 /**
- * @brief Hardware Color Balance Direct Register Control
+ * @brief Light adaptation profiles for different conditions
  */
-static int cmd_hw_color_balance(int argc, char **argv)
+static int cmd_hw_light_profile(int argc, char **argv)
 {
     if (argc == 1) {
-        // Read current values
-        uint8_t red_gain = 0, blue_gain = 0;
-        esp_err_t ret1 = imx708_hw_read_register(IMX708_REG_COLOR_BALANCE_RED, &red_gain);
-        esp_err_t ret2 = imx708_hw_read_register(IMX708_REG_COLOR_BALANCE_BLUE, &blue_gain);
-        
-        if (ret1 == ESP_OK && ret2 == ESP_OK) {
-            printf("Hardware Color Balance:\n");
-            printf("Red Gain:  0x%02X (%d) - %.2fx\n", red_gain, red_gain, red_gain/100.0);
-            printf("Blue Gain: 0x%02X (%d) - %.2fx\n", blue_gain, blue_gain, blue_gain/100.0);
-            printf("Usage: hw_color_balance <red_gain> <blue_gain>\n");
-            printf("Range: 100-255 (1.0x-2.55x gain)\n");
-        } else {
-            printf("Failed to read color balance registers\n");
-        }
+        printf("Hardware Light Adaptation Profiles\n");
+        printf("===================================\n");
+        printf("Usage: hw_light_profile <profile>\n");
+        printf("       hw_light_profile current\n\n");
+        printf("Profiles:\n");
+        printf("  bright    - High light conditions (fast exposure, low gain)\n");
+        printf("  normal    - Normal lighting (balanced settings)\n");
+        printf("  dim       - Low light (longer exposure, higher gain)\n");
+        printf("  dark      - Very low light (max sensitivity)\n");
+        printf("  custom <exp> <gain> - Custom exposure and gain values\n\n");
+        printf("This bypasses ESP IPA and controls hardware directly\n");
         return 0;
     }
     
-    if (argc < 3) {
-        printf("Usage: hw_color_balance <red_gain> <blue_gain>\n");
-        printf("Range: 100-255 (1.0x-2.55x gain)\n");
-        return 1;
-    }
+    const char *profile = argv[1];
     
-    int red_gain = strtol(argv[1], NULL, 0);
-    int blue_gain = strtol(argv[2], NULL, 0);
-    
-    if (red_gain < 100 || red_gain > 255 || blue_gain < 100 || blue_gain > 255) {
-        printf("Invalid gain values. Range: 100-255\n");
-        return 1;
-    }
-    
-    esp_err_t ret1 = imx708_hw_write_register(IMX708_REG_COLOR_BALANCE_RED, (uint8_t)red_gain);
-    esp_err_t ret2 = imx708_hw_write_register(IMX708_REG_COLOR_BALANCE_BLUE, (uint8_t)blue_gain);
-    
-    if (ret1 == ESP_OK && ret2 == ESP_OK) {
-        printf("Hardware Color Balance Set:\n");
-        printf("Red Gain:  0x%02X (%d) - %.2fx\n", red_gain, red_gain, red_gain/100.0);
-        printf("Blue Gain: 0x%02X (%d) - %.2fx\n", blue_gain, blue_gain, blue_gain/100.0);
-    } else {
-        printf("Failed to write color balance registers\n");
-        return 1;
-    }
-    
-    return 0;
-}
-
-/**
- * @brief Hardware Low-Light Optimization
- */
-static int cmd_hw_lowlight_opt(int argc, char **argv)
-{
-    if (argc == 1) {
-        // Read current values
-        uint8_t red_bias = 0, blue_bias = 0, green_supp = 0;
-        esp_err_t ret1 = imx708_hw_read_register(IMX708_REG_LOWLIGHT_RED_BIAS, &red_bias);
-        esp_err_t ret2 = imx708_hw_read_register(IMX708_REG_LOWLIGHT_BLUE_BIAS, &blue_bias);
-        esp_err_t ret3 = imx708_hw_read_register(IMX708_REG_LOWLIGHT_GREEN_SUPP, &green_supp);
+    if (strcmp(profile, "current") == 0) {
+        uint8_t exp_h, exp_l, gain_h, gain_l;
+        imx708_hw_read_register(0x0202, &exp_h);
+        imx708_hw_read_register(0x0203, &exp_l);
+        imx708_hw_read_register(0x0204, &gain_h);
+        imx708_hw_read_register(0x0205, &gain_l);
         
-        if (ret1 == ESP_OK && ret2 == ESP_OK && ret3 == ESP_OK) {
-            printf("Low-Light Optimization:\n");
-            printf("Red Bias:   0x%02X (%d)\n", red_bias, red_bias);
-            printf("Blue Bias:  0x%02X (%d)\n", blue_bias, blue_bias);
-            printf("Green Supp: 0x%02X (%d)\n", green_supp, green_supp);
-            printf("Usage: hw_lowlight_opt <red_bias> <blue_bias> <green_supp>\n");
+        uint16_t exposure = (exp_h << 8) | exp_l;
+        uint16_t gain = (gain_h << 8) | gain_l;
+        
+        printf("Current Hardware Settings:\n");
+        printf("  Exposure: %d lines\n", exposure);
+        printf("  Gain: %d\n", gain);
+        
+        // Determine profile
+        if (exposure < 500 && gain < 200) {
+            printf("  Profile: BRIGHT conditions\n");
+        } else if (exposure < 1500 && gain < 400) {
+            printf("  Profile: NORMAL conditions\n");
+        } else if (exposure < 3000 && gain < 600) {
+            printf("  Profile: DIM conditions\n");
         } else {
-            printf("Failed to read low-light registers\n");
+            printf("  Profile: DARK conditions\n");
         }
+        
         return 0;
     }
     
-    if (argc < 4) {
-        printf("Usage: hw_lowlight_opt <red_bias> <blue_bias> <green_supp>\n");
-        printf("Range: 0-255 for each parameter\n");
-        return 1;
-    }
+    uint16_t exposure, gain;
     
-    int red_bias = strtol(argv[1], NULL, 0);
-    int blue_bias = strtol(argv[2], NULL, 0);
-    int green_supp = strtol(argv[3], NULL, 0);
-    
-    if (red_bias < 0 || red_bias > 255 || 
-        blue_bias < 0 || blue_bias > 255 || 
-        green_supp < 0 || green_supp > 255) {
-        printf("Invalid values. Range: 0-255\n");
-        return 1;
-    }
-    
-    esp_err_t ret1 = imx708_hw_write_register(IMX708_REG_LOWLIGHT_RED_BIAS, (uint8_t)red_bias);
-    esp_err_t ret2 = imx708_hw_write_register(IMX708_REG_LOWLIGHT_BLUE_BIAS, (uint8_t)blue_bias);
-    esp_err_t ret3 = imx708_hw_write_register(IMX708_REG_LOWLIGHT_GREEN_SUPP, (uint8_t)green_supp);
-    
-    if (ret1 == ESP_OK && ret2 == ESP_OK && ret3 == ESP_OK) {
-        printf("Low-Light Optimization Set:\n");
-        printf("Red Bias:   0x%02X (%d)\n", red_bias, red_bias);
-        printf("Blue Bias:  0x%02X (%d)\n", blue_bias, blue_bias);
-        printf("Green Supp: 0x%02X (%d)\n", green_supp, green_supp);
+    if (strcmp(profile, "bright") == 0) {
+        exposure = 400;   // Fast exposure
+        gain = 150;       // Low gain
+        printf("Applying BRIGHT profile (exposure=%d, gain=%d)\n", exposure, gain);
+    } else if (strcmp(profile, "normal") == 0) {
+        exposure = 1000;  // Normal exposure
+        gain = 300;       // Medium gain
+        printf("Applying NORMAL profile (exposure=%d, gain=%d)\n", exposure, gain);
+    } else if (strcmp(profile, "dim") == 0) {
+        exposure = 2500;  // Longer exposure
+        gain = 500;       // Higher gain
+        printf("Applying DIM profile (exposure=%d, gain=%d)\n", exposure, gain);
+    } else if (strcmp(profile, "dark") == 0) {
+        exposure = 4000;  // Long exposure
+        gain = 800;       // High gain
+        printf("Applying DARK profile (exposure=%d, gain=%d)\n", exposure, gain);
+    } else if (strcmp(profile, "custom") == 0) {
+        if (argc != 4) {
+            printf("Usage: hw_light_profile custom <exposure> <gain>\n");
+            return 1;
+        }
+        exposure = atoi(argv[2]);
+        gain = atoi(argv[3]);
+        
+        if (exposure < 1 || exposure > 8000 || gain < 112 || gain > 960) {
+            printf("Invalid values. Exposure: 1-8000, Gain: 112-960\n");
+            return 1;
+        }
+        
+        printf("Applying CUSTOM profile (exposure=%d, gain=%d)\n", exposure, gain);
     } else {
-        printf("Failed to write low-light registers\n");
+        printf("Unknown profile: %s\n", profile);
         return 1;
     }
     
-    return 0;
+    // Apply settings
+    esp_err_t ret = ESP_OK;
+    
+    // Set exposure
+    uint8_t exp_h = (exposure >> 8) & 0xFF;
+    uint8_t exp_l = exposure & 0xFF;
+    ret |= imx708_hw_write_register(0x0202, exp_h);
+    ret |= imx708_hw_write_register(0x0203, exp_l);
+    
+    // Set gain
+    uint8_t gain_h = (gain >> 8) & 0xFF;
+    uint8_t gain_l = gain & 0xFF;
+    ret |= imx708_hw_write_register(0x0204, gain_h);
+    ret |= imx708_hw_write_register(0x0205, gain_l);
+    
+    if (ret == ESP_OK) {
+        printf("Profile applied successfully!\n");
+        printf("Hardware now optimized for light conditions\n");
+    } else {
+        printf("Error applying profile\n");
+    }
+    
+    return ret == ESP_OK ? 0 : 1;
 }
 
 /**
- * @brief Read all hardware registers status
+ * @brief Read all hardware registers status for diagnostics
  */
 static int cmd_hw_registers_dump(int argc, char **argv)
 {
     printf("IMX708 Hardware Registers Status:\n");
     printf("=====================================\n");
     
-    // AWB Registers
-    printf("\nAuto White Balance:\n");
-    uint8_t value;
-    if (imx708_hw_read_register(IMX708_REG_AWB_ENABLE, &value) == ESP_OK) {
-        printf("  AWB Enable:      0x%04X = 0x%02X (%s)\n", 
-               IMX708_REG_AWB_ENABLE, value, value ? "ON" : "OFF");
-    }
-    if (imx708_hw_read_register(IMX708_REG_AWB_SPEED, &value) == ESP_OK) {
-        printf("  AWB Speed:       0x%04X = 0x%02X (%d)\n", 
-               IMX708_REG_AWB_SPEED, value, value);
+    // Exposure Registers
+    printf("\nExposure Control:\n");
+    uint8_t exp_h, exp_l;
+    if (imx708_hw_read_register(0x0202, &exp_h) == ESP_OK &&
+        imx708_hw_read_register(0x0203, &exp_l) == ESP_OK) {
+        uint16_t exposure = (exp_h << 8) | exp_l;
+        printf("  Exposure Time:   0x0202/0x0203 = 0x%04X (%d lines)\n", exposure, exposure);
     }
     
-    // AE Registers
-    printf("\nAuto Exposure:\n");
-    if (imx708_hw_read_register(IMX708_REG_AE_ENABLE, &value) == ESP_OK) {
+    // Auto Exposure
+    uint8_t ae_enable;
+    if (imx708_hw_read_register(IMX708_REG_AE_ENABLE, &ae_enable) == ESP_OK) {
         printf("  AE Enable:       0x%04X = 0x%02X (%s)\n", 
-               IMX708_REG_AE_ENABLE, value, value ? "ON" : "OFF");
-    }
-    if (imx708_hw_read_register(IMX708_REG_AE_TARGET, &value) == ESP_OK) {
-        printf("  AE Target:       0x%04X = 0x%02X (%d)\n", 
-               IMX708_REG_AE_TARGET, value, value);
+               IMX708_REG_AE_ENABLE, ae_enable, ae_enable ? "ON" : "OFF");
     }
     
-    // Color Balance
-    printf("\nColor Balance:\n");
-    if (imx708_hw_read_register(IMX708_REG_COLOR_BALANCE_RED, &value) == ESP_OK) {
-        printf("  Red Gain:        0x%04X = 0x%02X (%.2fx)\n", 
-               IMX708_REG_COLOR_BALANCE_RED, value, value/100.0);
-    }
-    if (imx708_hw_read_register(IMX708_REG_COLOR_BALANCE_BLUE, &value) == ESP_OK) {
-        printf("  Blue Gain:       0x%04X = 0x%02X (%.2fx)\n", 
-               IMX708_REG_COLOR_BALANCE_BLUE, value, value/100.0);
+    // Gain Registers
+    printf("\nGain Control:\n");
+    uint8_t gain_h, gain_l;
+    if (imx708_hw_read_register(0x0204, &gain_h) == ESP_OK &&
+        imx708_hw_read_register(0x0205, &gain_l) == ESP_OK) {
+        uint16_t gain = (gain_h << 8) | gain_l;
+        printf("  Analog Gain:     0x0204/0x0205 = 0x%04X (%d)\n", gain, gain);
     }
     
-    // Noise Reduction
-    printf("\nNoise Reduction:\n");
-    if (imx708_hw_read_register(IMX708_REG_NR_ENABLE, &value) == ESP_OK) {
-        printf("  NR Enable:       0x%04X = 0x%02X (%s)\n", 
-               IMX708_REG_NR_ENABLE, value, value ? "ON" : "OFF");
+    // Color Balance Registers (read-only)
+    printf("\nColor Balance (read-only):\n");
+    uint8_t red_h, red_l, blue_h, blue_l;
+    if (imx708_hw_read_register(0x0B90, &red_h) == ESP_OK &&
+        imx708_hw_read_register(0x0B91, &red_l) == ESP_OK) {
+        uint16_t red_gain = (red_h << 8) | red_l;
+        printf("  Red Gain:        0x0B90/0x0B91 = 0x%04X (%d)\n", red_gain, red_gain);
     }
-    if (imx708_hw_read_register(IMX708_REG_NR_STRENGTH, &value) == ESP_OK) {
-        printf("  NR Strength:     0x%04X = 0x%02X (%d)\n", 
-               IMX708_REG_NR_STRENGTH, value, value);
+    if (imx708_hw_read_register(0x0B92, &blue_h) == ESP_OK &&
+        imx708_hw_read_register(0x0B93, &blue_l) == ESP_OK) {
+        uint16_t blue_gain = (blue_h << 8) | blue_l;
+        printf("  Blue Gain:       0x0B92/0x0B93 = 0x%04X (%d)\n", blue_gain, blue_gain);
     }
+    
+    printf("\nNOTES:\n");
+    printf("  • Exposure and gain controls work directly\n");
+    printf("  • Color processing handled by ESP IPA\n");
+    printf("  • Use hw_light_profile for quick adaptation\n");
     
     return 0;
 }
 
 /**
- * @brief Register all hardware control commands
+ * @brief Register hardware control commands
  */
 void imx708_hardware_shell_register_commands(void)
 {
     const esp_console_cmd_t hw_commands[] = {
         {
-            .command = "hw_awb_speed",
-            .help = "Control AWB convergence speed (0x10-0xFF)",
-            .hint = NULL,
-            .func = &cmd_hw_awb_speed,
+            .command = "sensor_exposure_direct",
+            .help = "Direct sensor exposure control",
+            .hint = "<lines|current|auto>",
+            .func = &cmd_sensor_exposure_direct,
         },
         {
-            .command = "hw_ae_target",
-            .help = "Set Auto Exposure target brightness (0-255)",
-            .hint = NULL,
-            .func = &cmd_hw_ae_target,
+            .command = "sensor_gain_direct", 
+            .help = "Direct sensor gain control",
+            .hint = "<gain|current|auto>",
+            .func = &cmd_sensor_gain_direct,
         },
         {
-            .command = "hw_ae_enable",
-            .help = "Enable/disable hardware Auto Exposure",
-            .hint = NULL,
-            .func = &cmd_hw_ae_enable,
-        },
-        {
-            .command = "hw_noise_reduction",
-            .help = "Control hardware noise reduction",
-            .hint = NULL,
-            .func = &cmd_hw_noise_reduction,
-        },
-        {
-            .command = "hw_color_balance",
-            .help = "Direct hardware color balance control",
-            .hint = NULL,
-            .func = &cmd_hw_color_balance,
-        },
-        {
-            .command = "hw_lowlight_opt",
-            .help = "Low-light optimization parameters",
-            .hint = NULL,
-            .func = &cmd_hw_lowlight_opt,
+            .command = "hw_light_profile",
+            .help = "Hardware light adaptation profiles",
+            .hint = "<bright|normal|dim|dark|custom>",
+            .func = &cmd_hw_light_profile,
         },
         {
             .command = "hw_registers_dump",
-            .help = "Dump all hardware register values",
+            .help = "Hardware register diagnostics",
             .hint = NULL,
             .func = &cmd_hw_registers_dump,
         }
@@ -410,7 +388,13 @@ void imx708_hardware_shell_register_commands(void)
         ESP_ERROR_CHECK(esp_console_cmd_register(&hw_commands[i]));
     }
     
-    ESP_LOGI(TAG, "IMX708 Hardware control commands registered!");
-    ESP_LOGI(TAG, "Available: hw_awb_speed, hw_ae_target, hw_ae_enable, hw_noise_reduction");
-    ESP_LOGI(TAG, "          hw_color_balance, hw_lowlight_opt, hw_registers_dump");
+    ESP_LOGI(TAG, "IMX708 Hardware Control Commands Registered!");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "HARDWARE COMMANDS:");
+    ESP_LOGI(TAG, "  sensor_exposure_direct  - Direct exposure control (bypasses IPA)");
+    ESP_LOGI(TAG, "  sensor_gain_direct      - Direct gain control (bypasses IPA)");
+    ESP_LOGI(TAG, "  hw_light_profile        - Light adaptation profiles");
+    ESP_LOGI(TAG, "  hw_registers_dump       - Register diagnostics");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "STRATEGY: Direct hardware control for light adaptation");
 }

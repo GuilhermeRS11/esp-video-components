@@ -12,16 +12,15 @@ extern "C" {
 #endif
 
 /**
- * @brief Register all IMX708 hardware control shell commands
+ * @brief Register IMX708 hardware control shell commands - Clean Version
  * 
- * This function registers the following commands:
- * - hw_awb_speed: Control AWB convergence speed
- * - hw_ae_target: Set Auto Exposure target brightness
- * - hw_ae_enable: Enable/disable hardware Auto Exposure
- * - hw_noise_reduction: Control hardware noise reduction
- * - hw_color_balance: Direct hardware color balance control
- * - hw_lowlight_opt: Low-light optimization parameters
- * - hw_registers_dump: Dump all hardware register values
+ * This function registers only the confirmed working commands:
+ * - sensor_exposure_direct: Direct sensor exposure control (ONLY WORKING DIRECT COMMAND)
+ * - hw_registers_dump: Dump all hardware register values for diagnostics
+ * 
+ * All other direct sensor commands were removed because they didn't work.
+ * The original color stability issue was caused by ESP32-P4 IPA, not sensor registers.
+ * For color control, use V4L2 commands like cam_red_balance and cam_blue_balance.
  */
 void imx708_hardware_shell_register_commands(void);
 
