@@ -412,6 +412,7 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
     ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*"), TAG, "failed to set access control allow origin");
     ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "X-Framerate", http_string), TAG, "failed to set x framerate");
 
+    uint64_t last_send_time = 0;
     while (1) {
         int hlen;
         struct timespec ts;
@@ -422,11 +423,30 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
         memset(&buf, 0, sizeof(buf));
         buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
+
+        // Proteção contra travamento: select() com timeout de 100ms
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(video->fd, &fds);
+    tv.tv_sec = 0;
+        uint64_t t0 = esp_timer_get_time();
+    tv.tv_usec = 10000; // 10ms
+        int r = select(video->fd + 1, &fds, NULL, NULL, &tv);
+        if (r == 0) {
+            // Timeout: sem frame disponível, apenas continue
+            continue;
+        } else if (r < 0) {
+            ESP_LOGE(TAG, "select() error on video fd");
+            continue;
+        }
+
         ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_DQBUF, &buf), TAG, "failed to receive video frame");
         if (!(buf.flags & V4L2_BUF_FLAG_DONE)) {
             ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_QBUF, &buf), TAG, "failed to queue video frame");
             continue;
         }
+        uint64_t t1 = esp_timer_get_time();
 
         ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)), fail0, TAG, "failed to send boundary");
 
@@ -442,11 +462,13 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
                               fail0, TAG, "failed to encode video frame");
         }
 
+        uint64_t t2 = esp_timer_get_time();
         ESP_GOTO_ON_ERROR(clock_gettime(CLOCK_MONOTONIC, &ts), fail0, TAG, "failed to get time");
         ESP_GOTO_ON_FALSE((hlen = snprintf(http_string, sizeof(http_string), STREAM_PART, jpeg_encoded_size, ts.tv_sec, ts.tv_nsec)) > 0,
                           ESP_FAIL, fail0, TAG, "failed to format part buffer");
         ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, http_string, hlen), fail0, TAG, "failed to send boundary");
 
+        uint64_t t3 = esp_timer_get_time();
         ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, (char *)video->jpeg_out_buf, jpeg_encoded_size), fail0, TAG, "failed to send jpeg");
         if (locked) {
             xSemaphoreGive(video->sem);
@@ -454,6 +476,46 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
         }
 
         ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_QBUF, &buf), TAG, "failed to queue video frame");
+
+        uint64_t t4 = esp_timer_get_time();
+        
+        // Frame rate control: if last send took too long, skip some frames
+        uint64_t send_time = t4 - t3;
+        if (last_send_time > 0 && send_time > 80000) { // If send took > 80ms
+            // Skip next few frames to catch up
+            for (int skip = 0; skip < 3; skip++) {
+                struct v4l2_buffer skip_buf;
+                memset(&skip_buf, 0, sizeof(skip_buf));
+                skip_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                skip_buf.memory = V4L2_MEMORY_MMAP;
+                
+                fd_set skip_fds;
+                struct timeval skip_tv;
+                FD_ZERO(&skip_fds);
+                FD_SET(video->fd, &skip_fds);
+                skip_tv.tv_sec = 0;
+                skip_tv.tv_usec = 5000; // 5ms timeout
+                
+                if (select(video->fd + 1, &skip_fds, NULL, NULL, &skip_tv) > 0) {
+                    if (ioctl(video->fd, VIDIOC_DQBUF, &skip_buf) == 0) {
+                        ioctl(video->fd, VIDIOC_QBUF, &skip_buf); // Return immediately
+                    }
+                } else {
+                    break; // No more frames to skip
+                }
+            }
+        }
+        last_send_time = send_time;
+
+        /* Frame logging */
+        
+        static int frame_count = 0;
+        frame_count++;
+        if (frame_count % 30 == 0) {
+            ESP_LOGI(TAG, "Frame timing: select+DQBUF=%lldus, encode=%lldus, httpd_prepare=%lldus, httpd_send=%lldus, total=%lldus, frame_size=%lu bytes", 
+                (t1-t0), (t2-t1), (t3-t2), (t4-t3), (t4-t0), (unsigned long)jpeg_encoded_size);
+        }
+        
     }
 
     return ESP_OK;
