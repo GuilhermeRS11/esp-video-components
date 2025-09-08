@@ -9,4 +9,3 @@ dependencies:
   espressif/mdns: "^1.0.3"
   esp_wifi_remote:
     version: "*"
-

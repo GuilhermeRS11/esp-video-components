@@ -260,7 +260,7 @@ void simple_shell_start(void)
     camera_shell_register_commands();
     
     // Register IMX708 hardware register control commands
-    //imx708_hardware_shell_register_commands();
+    imx708_hardware_shell_register_commands();
     
     shell_running = true;
     

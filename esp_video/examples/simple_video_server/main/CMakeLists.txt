@@ -2,7 +2,7 @@ set(srcs "simple_video_server_example.c"
          "shell.c"
          "shell/camera_shell.c"
          "shell/simple_shell.c"
-         )
+         "shell/imx708_hardware_shell.c")
 set(html_files "../frontend/gzipped/index.html.gz"
                "../frontend/gzipped/loading.jpg.gz"
                "../frontend/gzipped/favicon.ico.gz"

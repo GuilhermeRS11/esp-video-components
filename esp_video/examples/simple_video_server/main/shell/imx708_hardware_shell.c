@@ -12,8 +12,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "imx708.h"
-#include "imx708_hardware_controls.h"
-#include "imx708_hardware_shell.h"
+
+// IMX708 Register definitions for hardware control
+#define IMX708_REG_AE_ENABLE    0x3100  // Auto Exposure Enable/Disable
+#define IMX708_REG_AGC_ENABLE   0x3200  // Auto Gain Control Enable/Disable
 
 static const char* TAG = "imx708_hw_shell";
 
