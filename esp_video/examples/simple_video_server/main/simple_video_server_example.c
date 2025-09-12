@@ -5,14 +5,18 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/param.h>
+#include <sys/select.h>
 #include <sys/errno.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "cJSON.h"
 #include "esp_event.h"
 #include "esp_err.h"
@@ -56,16 +60,44 @@ extern const uint8_t assets_index_css_gz_end[] asm("_binary_index_css_gz_end");
 /**
  * @brief Web cam control structure
  */
+typedef struct frame_item {
+    uint8_t slot;        // index into out_bufs
+    uint32_t size;       // encoded size
+} frame_item_t;
+
 typedef struct web_cam_video {
     int fd;
     uint8_t index;
+    const char *dev_name;
 
     example_encoder_handle_t encoder_handle;
-    uint8_t *jpeg_out_buf;
-    uint32_t jpeg_out_size;
+    uint8_t *jpeg_out_buf;      // legacy single buffer (unused in streaming)
+    uint32_t jpeg_out_size;     // legacy single buffer size
 
     uint8_t *buffer[EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER];
     uint32_t buffer_size;
+    uint32_t buffer_count;
+
+    // Producer/consumer encoded buffers
+    uint8_t **out_bufs;         // array of pointers (size out_buf_count)
+    uint32_t out_buf_size;      // per-buffer capacity
+    uint8_t  out_buf_count;     // number of output buffers (queue depth)
+    QueueHandle_t frame_q;      // produced frames (frame_item_t)
+    QueueHandle_t free_q;       // free slots (uint8_t)
+    TaskHandle_t producer_task; // producer task handle
+    SemaphoreHandle_t stream_lock; // allow only one streaming consumer per video
+
+    // Diagnostics
+    uint32_t stats_published;
+    uint32_t stats_drops;
+    uint32_t stats_dq_errors;
+    uint32_t stats_recoveries;
+    uint32_t stats_restart_fail;
+    uint32_t stats_select_timeouts;
+    int64_t  last_pub_us;
+    uint32_t expected_fps;
+    uint32_t meas_frames_window;
+    int64_t  meas_window_start_us;
 
     uint32_t width;
     uint32_t height;
@@ -94,6 +126,12 @@ typedef struct request_desc {
 } request_desc_t;
 
 static const char *TAG = "example";
+
+// Forward declaration for recovery routine
+static esp_err_t restart_video_stream(web_cam_video_t *video);
+
+// Forward declarations for producer model
+static void producer_task(void *arg);
 
 static bool is_valid_web_cam(web_cam_video_t *video)
 {
@@ -133,43 +171,17 @@ static esp_err_t decode_request(web_cam_t *web_cam, httpd_req_t *req, request_de
 
 static esp_err_t capture_video_image(httpd_req_t *req, web_cam_video_t *video, bool is_jpeg)
 {
-    esp_err_t ret;
-    struct v4l2_buffer buf;
-    const char *type_str = is_jpeg ? "JPEG" : "binary";
-    uint32_t jpeg_encoded_size;
-
-    memset(&buf, 0, sizeof(buf));
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_DQBUF, &buf), TAG, "failed to receive video frame");
-    if (!(buf.flags & V4L2_BUF_FLAG_DONE)) {
-        return ESP_ERR_INVALID_RESPONSE;
+    (void)is_jpeg; // we always return JPEG from the producer
+    frame_item_t item = {0};
+    // wait up to 1s for a produced frame
+    if (xQueueReceive(video->frame_q, &item, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
-
-    if (!is_jpeg || video->pixel_format == V4L2_PIX_FMT_JPEG) {
-        /* Directly send the buffer of raw data */
-        ESP_GOTO_ON_ERROR(httpd_resp_send(req, (char *)video->buffer[buf.index], buf.bytesused), fail0, TAG, "failed to send %s", type_str);
-        jpeg_encoded_size = buf.bytesused;
-    } else {
-        ESP_GOTO_ON_FALSE(xSemaphoreTake(video->sem, portMAX_DELAY) == pdPASS, ESP_FAIL, fail0, TAG, "failed to take semaphore");
-        ret = example_encoder_process(video->encoder_handle, video->buffer[buf.index], video->buffer_size,
-                                      video->jpeg_out_buf, video->jpeg_out_size, &jpeg_encoded_size);
-        xSemaphoreGive(video->sem);
-        ESP_GOTO_ON_ERROR(ret, fail0, TAG, "failed to encode video frame");
-        ESP_GOTO_ON_ERROR(httpd_resp_send(req, (char *)video->jpeg_out_buf, jpeg_encoded_size), fail0, TAG, "failed to send %s", type_str);
-    }
-
-    ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_QBUF, &buf), TAG, "failed to queue video frame");
-
-    ESP_GOTO_ON_ERROR(httpd_resp_sendstr_chunk(req, NULL), fail0, TAG, "failed to send null");
-
-    ESP_LOGD(TAG, "send %s image%d size: %" PRIu32, type_str, video->index, jpeg_encoded_size);
-
-    return ESP_OK;
-
-fail0:
-    ioctl(video->fd, VIDIOC_QBUF, &buf);
-    return ret;
+    esp_err_t err = httpd_resp_send(req, (char *)video->out_bufs[item.slot], item.size);
+    // return slot to free list
+    uint8_t slot = item.slot;
+    xQueueSend(video->free_q, &slot, portMAX_DELAY);
+    return err;
 }
 
 static char *get_cameras_json(web_cam_t *web_cam)
@@ -400,10 +412,18 @@ static esp_err_t static_file_handler(httpd_req_t *req)
 static esp_err_t image_stream_handler(httpd_req_t *req)
 {
     esp_err_t ret;
-    struct v4l2_buffer buf;
     char http_string[128];
-    bool locked = false;
     web_cam_video_t *video = (web_cam_video_t *)req->user_ctx;
+
+    // allow only one streaming client per video
+    if (xSemaphoreTake(video->stream_lock, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "Stream already in use");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Stream iniciado - video%d fd=%d", video->index, video->fd);
 
     ESP_RETURN_ON_FALSE(snprintf(http_string, sizeof(http_string), "%" PRIu32, video->frame_rate) > 0,
                         ESP_FAIL, TAG, "failed to format framerate buffer");
@@ -412,119 +432,62 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
     ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*"), TAG, "failed to set access control allow origin");
     ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "X-Framerate", http_string), TAG, "failed to set x framerate");
 
-    uint64_t last_send_time = 0;
+    frame_item_t item = {0};
+    uint32_t sent_count = 0;
+    uint32_t empty_polls = 0;
     while (1) {
         int hlen;
         struct timespec ts;
-        uint32_t jpeg_encoded_size;
 
-        locked = false;
-
-        memset(&buf, 0, sizeof(buf));
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-
-        // Proteção contra travamento: select() com timeout de 100ms
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(video->fd, &fds);
-    tv.tv_sec = 0;
-        uint64_t t0 = esp_timer_get_time();
-    tv.tv_usec = 10000; // 10ms
-        int r = select(video->fd + 1, &fds, NULL, NULL, &tv);
-        if (r == 0) {
-            // Timeout: sem frame disponível, apenas continue
-            continue;
-        } else if (r < 0) {
-            ESP_LOGE(TAG, "select() error on video fd");
-            continue;
-        }
-
-        ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_DQBUF, &buf), TAG, "failed to receive video frame");
-        if (!(buf.flags & V4L2_BUF_FLAG_DONE)) {
-            ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_QBUF, &buf), TAG, "failed to queue video frame");
-            continue;
-        }
-        uint64_t t1 = esp_timer_get_time();
-
-        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)), fail0, TAG, "failed to send boundary");
-
-        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
-            video->jpeg_out_buf = video->buffer[buf.index];
-            jpeg_encoded_size = buf.bytesused;
-        } else {
-            ESP_GOTO_ON_FALSE(xSemaphoreTake(video->sem, portMAX_DELAY) == pdPASS, ESP_FAIL, fail0, TAG, "failed to take semaphore");
-            locked = true;
-
-            ESP_GOTO_ON_ERROR(example_encoder_process(video->encoder_handle, video->buffer[buf.index], video->buffer_size,
-                              video->jpeg_out_buf, video->jpeg_out_size, &jpeg_encoded_size),
-                              fail0, TAG, "failed to encode video frame");
-        }
-
-        uint64_t t2 = esp_timer_get_time();
-        ESP_GOTO_ON_ERROR(clock_gettime(CLOCK_MONOTONIC, &ts), fail0, TAG, "failed to get time");
-        ESP_GOTO_ON_FALSE((hlen = snprintf(http_string, sizeof(http_string), STREAM_PART, jpeg_encoded_size, ts.tv_sec, ts.tv_nsec)) > 0,
-                          ESP_FAIL, fail0, TAG, "failed to format part buffer");
-        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, http_string, hlen), fail0, TAG, "failed to send boundary");
-
-        uint64_t t3 = esp_timer_get_time();
-        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, (char *)video->jpeg_out_buf, jpeg_encoded_size), fail0, TAG, "failed to send jpeg");
-        if (locked) {
-            xSemaphoreGive(video->sem);
-            locked = false;
-        }
-
-        ESP_RETURN_ON_ERROR(ioctl(video->fd, VIDIOC_QBUF, &buf), TAG, "failed to queue video frame");
-
-        uint64_t t4 = esp_timer_get_time();
-        
-        // Frame rate control: if last send took too long, skip some frames
-        uint64_t send_time = t4 - t3;
-        if (last_send_time > 0 && send_time > 80000) { // If send took > 80ms
-            // Skip next few frames to catch up
-            for (int skip = 0; skip < 3; skip++) {
-                struct v4l2_buffer skip_buf;
-                memset(&skip_buf, 0, sizeof(skip_buf));
-                skip_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                skip_buf.memory = V4L2_MEMORY_MMAP;
-                
-                fd_set skip_fds;
-                struct timeval skip_tv;
-                FD_ZERO(&skip_fds);
-                FD_SET(video->fd, &skip_fds);
-                skip_tv.tv_sec = 0;
-                skip_tv.tv_usec = 5000; // 5ms timeout
-                
-                if (select(video->fd + 1, &skip_fds, NULL, NULL, &skip_tv) > 0) {
-                    if (ioctl(video->fd, VIDIOC_DQBUF, &skip_buf) == 0) {
-                        ioctl(video->fd, VIDIOC_QBUF, &skip_buf); // Return immediately
-                    }
-                } else {
-                    break; // No more frames to skip
+        // Wait for next produced frame
+        if (xQueueReceive(video->frame_q, &item, pdMS_TO_TICKS(500)) != pdTRUE) {
+            // no frame available, continue trying
+            empty_polls++;
+            if (empty_polls % 6 == 0) { // ~3s
+                ESP_LOGW(TAG, "[HTTP] video%d sem frames (%lu polls vazios)", video->index, (unsigned long)empty_polls);
+                // Fallback: se o produtor não publica há >3s, tente reiniciar o stream
+                int64_t now = esp_timer_get_time();
+                if (now - video->last_pub_us > 3000000) {
+                    ESP_LOGW(TAG, "[HTTP] video%d sem publicações há %lld us, tentando restart", video->index, (long long)(now - video->last_pub_us));
+                    (void)restart_video_stream(video);
+                    empty_polls = 0; // reinicia janela de observação
                 }
             }
+            continue;
         }
-        last_send_time = send_time;
+        empty_polls = 0;
 
-        /* Frame logging */
-        
-        static int frame_count = 0;
-        frame_count++;
-        if (frame_count % 30 == 0) {
-            ESP_LOGI(TAG, "Frame timing: select+DQBUF=%lldus, encode=%lldus, httpd_prepare=%lldus, httpd_send=%lldus, total=%lldus, frame_size=%lu bytes", 
-                (t1-t0), (t2-t1), (t3-t2), (t4-t3), (t4-t0), (unsigned long)jpeg_encoded_size);
+        // Send multipart headers + JPEG
+        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)), fail0, TAG, "failed to send boundary");
+        ESP_GOTO_ON_ERROR(clock_gettime(CLOCK_MONOTONIC, &ts), fail0, TAG, "failed to get time");
+        ESP_GOTO_ON_FALSE((hlen = snprintf(http_string, sizeof(http_string), STREAM_PART, (unsigned int)item.size, ts.tv_sec, ts.tv_nsec)) > 0,
+                          ESP_FAIL, fail0, TAG, "failed to format part buffer");
+        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, http_string, hlen), fail0, TAG, "failed to send part header");
+        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, (char *)video->out_bufs[item.slot], item.size), fail0, TAG, "failed to send jpeg");
+
+        // Return slot to free list
+        uint8_t slot = item.slot;
+        xQueueSend(video->free_q, &slot, portMAX_DELAY);
+
+        sent_count++;
+        if ((sent_count % 30) == 0) {
+            ESP_LOGI(TAG, "[HTTP] video%d enviados=%lu (free=%lu queued=%lu)", video->index, (unsigned long)sent_count,
+                     (unsigned long)uxQueueMessagesWaiting(video->free_q),
+                     (unsigned long)uxQueueMessagesWaiting(video->frame_q));
         }
-        
     }
 
+    // not reached
+    xSemaphoreGive(video->stream_lock);
     return ESP_OK;
 
 fail0:
-    if (locked) {
-        xSemaphoreGive(video->sem);
+    // Return slot if we popped one already
+    if (item.size && item.slot < video->out_buf_count) {
+        uint8_t slot = item.slot;
+        xQueueSend(video->free_q, &slot, 0);
     }
-    ioctl(video->fd, VIDIOC_QBUF, &buf);
+    xSemaphoreGive(video->stream_lock);
     return ret;
 }
 
@@ -559,11 +522,13 @@ static esp_err_t capture_binary_handler(httpd_req_t *req)
 static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_config_t *config, int index)
 {
     int fd;
-    int ret;
+    esp_err_t ret = ESP_FAIL;
     struct v4l2_streamparm sparm;
     struct v4l2_requestbuffers req;
     struct v4l2_captureparm *cparam = &sparm.parm.capture;
     struct v4l2_fract *timeperframe = &cparam->timeperframe;
+
+    ESP_LOGI(TAG, "[DQBUF_DEBUG] Init video%d: %s", index, config->dev_name);
 
     fd = open(config->dev_name, O_RDWR);
     ESP_RETURN_ON_FALSE(fd >= 0, ESP_ERR_NOT_FOUND, TAG, "Open video device %s failed", config->dev_name);
@@ -572,12 +537,29 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
     sparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ESP_GOTO_ON_ERROR(ioctl(fd, VIDIOC_G_PARM, &sparm), fail0, TAG, "failed to get frame rate from %s", config->dev_name);
     video->frame_rate = timeperframe->denominator / timeperframe->numerator;
+    video->expected_fps = video->frame_rate;
+    ESP_LOGI(TAG, "video%d: fps reportado: %lu/%lu = %lu", index,
+             (unsigned long)timeperframe->denominator,
+             (unsigned long)timeperframe->numerator,
+             (unsigned long)video->frame_rate);
+
+    // Tentar fixar explicitamente o FPS via S_PARM ao valor obtido
+    // (alguns drivers precisam de S_PARM para estabilizar o timing)
+    struct v4l2_streamparm sparm_set = {0};
+    sparm_set.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    sparm_set.parm.capture.timeperframe.numerator = timeperframe->numerator;
+    sparm_set.parm.capture.timeperframe.denominator = timeperframe->denominator;
+    if (ioctl(fd, VIDIOC_S_PARM, &sparm_set) != 0) {
+        ESP_LOGW(TAG, "video%d: VIDIOC_S_PARM falhou (mantendo fps atual)", index);
+    }
 
     memset(&req, 0, sizeof(req));
     req.count  = EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER;
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
+    ESP_LOGI(TAG, "[BUFFER_DEBUG] Video%d: Solicitando %d buffers...", index, EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER);
     ESP_GOTO_ON_ERROR(ioctl(fd, VIDIOC_REQBUFS, &req), fail0, TAG, "failed to req buffers from %s", config->dev_name);
+    ESP_LOGI(TAG, "[BUFFER_DEBUG] Video%d: Driver alocou %d buffers", index, (int)req.count);
 
     for (int i = 0; i < EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER; i++) {
         struct v4l2_buffer buf;
@@ -595,20 +577,31 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
         ESP_GOTO_ON_ERROR(ioctl(fd, VIDIOC_QBUF, &buf), fail0, TAG, "failed to queue frame vbuf from %s", config->dev_name);
     }
 
+    ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Todos os %d buffers configurados e enfileirados", index, EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER);
+
     struct v4l2_format format;
     memset(&format, 0, sizeof(struct v4l2_format));
     format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ESP_GOTO_ON_ERROR(ioctl(fd, VIDIOC_G_FMT, &format), fail0, TAG, "Failed get fmt from %s", config->dev_name);
 
     video->fd = fd;
+    video->dev_name = config->dev_name;
     video->width = format.fmt.pix.width;
     video->height = format.fmt.pix.height;
     video->pixel_format = format.fmt.pix.pixelformat;
     video->jpeg_quality = EXAMPLE_JPEG_ENC_QUALITY;
+    video->buffer_count = req.count;
+
+    ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Formato detectado: %lux%lu " V4L2_FMT_STR " (buffer_size=%lu bytes)", 
+             index, (unsigned long)video->width, (unsigned long)video->height, 
+             V4L2_FMT_STR_ARG(video->pixel_format), (unsigned long)video->buffer_size);
 
     if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+        ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Formato JPEG nativo detectado", index);
         ESP_GOTO_ON_ERROR(set_camera_jpeg_quality(video, EXAMPLE_JPEG_ENC_QUALITY), fail0, TAG, "failed to set jpeg quality");
+        video->support_control_jpeg_quality = 1;
     } else {
+        ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Formato RAW detectado, configurando encoder JPEG...", index);
         example_encoder_config_t encoder_config = {0};
 
         encoder_config.width = video->width;
@@ -617,8 +610,8 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
         encoder_config.quality = EXAMPLE_JPEG_ENC_QUALITY;
         ESP_GOTO_ON_ERROR(example_encoder_init(&encoder_config, &video->encoder_handle), fail0, TAG, "failed to init encoder");
 
-        ESP_GOTO_ON_ERROR(example_encoder_alloc_output_buffer(video->encoder_handle, &video->jpeg_out_buf, &video->jpeg_out_size),
-                          fail1, TAG, "failed to alloc jpeg output buf");
+        // We'll allocate multiple output buffers below for producer
+        ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Encoder configurado", index);
 
         video->support_control_jpeg_quality = 1;
     }
@@ -627,14 +620,76 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
     ESP_GOTO_ON_FALSE(video->sem, ESP_ERR_NO_MEM, fail2, TAG, "failed to create semaphore");
     xSemaphoreGive(video->sem);
 
+    // Create producer resources (queues, buffers, task, stream lock)
+    const uint8_t out_count = 10; // queue depth / number of encoded buffers
+    video->out_buf_count = out_count;
+    video->frame_q = xQueueCreate(out_count, sizeof(frame_item_t));
+    ESP_GOTO_ON_FALSE(video->frame_q, ESP_ERR_NO_MEM, fail2, TAG, "failed to create frame_q");
+    video->free_q = xQueueCreate(out_count, sizeof(uint8_t));
+    ESP_GOTO_ON_FALSE(video->free_q, ESP_ERR_NO_MEM, fail3, TAG, "failed to create free_q");
+    video->stream_lock = xSemaphoreCreateBinary();
+    ESP_GOTO_ON_FALSE(video->stream_lock, ESP_ERR_NO_MEM, fail4, TAG, "failed to create stream_lock");
+    xSemaphoreGive(video->stream_lock);
+
+    video->out_bufs = (uint8_t **)calloc(out_count, sizeof(uint8_t *));
+    ESP_GOTO_ON_FALSE(video->out_bufs, ESP_ERR_NO_MEM, fail5, TAG, "failed to alloc out_bufs array");
+
+    if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+        video->out_buf_size = video->buffer_size;
+        for (uint8_t i = 0; i < out_count; i++) {
+            video->out_bufs[i] = (uint8_t *)malloc(video->out_buf_size);
+            ESP_GOTO_ON_FALSE(video->out_bufs[i], ESP_ERR_NO_MEM, fail6, TAG, "failed to alloc jpeg out buf");
+        }
+    } else {
+        // allocate multiple encoder output buffers
+        uint32_t size0 = 0;
+        for (uint8_t i = 0; i < out_count; i++) {
+            uint8_t *ptr = NULL; uint32_t sz = 0;
+            ESP_GOTO_ON_ERROR(example_encoder_alloc_output_buffer(video->encoder_handle, &ptr, &sz), fail6, TAG, "failed to alloc jpeg output buf");
+            if (i == 0) {
+                size0 = sz;
+            }
+            video->out_bufs[i] = ptr;
+        }
+        video->out_buf_size = size0;
+    }
+
+    // initialize free slots
+    for (uint8_t i = 0; i < out_count; i++) {
+        xQueueSend(video->free_q, &i, portMAX_DELAY);
+    }
+
+    // start producer task
+    if (xTaskCreate(producer_task, "vid_producer", 8192, video, 7, &video->producer_task) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create producer task");
+        ret = ESP_FAIL;
+        goto fail6;
+    }
+
+    ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Inicialização concluída com sucesso!", index);
     return ESP_OK;
 
-fail2:
-    if (video->pixel_format != V4L2_PIX_FMT_JPEG) {
-        example_encoder_free_output_buffer(video->encoder_handle, video->jpeg_out_buf);
-        video->jpeg_out_buf = NULL;
+fail6:
+    if (video->out_bufs) {
+        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+            for (uint8_t i = 0; i < out_count; i++) {
+                if (video->out_bufs[i]) free(video->out_bufs[i]);
+            }
+        } else {
+            for (uint8_t i = 0; i < out_count; i++) {
+                if (video->out_bufs[i]) example_encoder_free_output_buffer(video->encoder_handle, video->out_bufs[i]);
+            }
+        }
+        free(video->out_bufs);
+        video->out_bufs = NULL;
     }
-fail1:
+fail5:
+    if (video->stream_lock) { vSemaphoreDelete(video->stream_lock); video->stream_lock = NULL; }
+fail4:
+    if (video->free_q) { vQueueDelete(video->free_q); video->free_q = NULL; }
+fail3:
+    if (video->frame_q) { vQueueDelete(video->frame_q); video->frame_q = NULL; }
+fail2:
     if (video->pixel_format != V4L2_PIX_FMT_JPEG) {
         example_encoder_deinit(video->encoder_handle);
         video->encoder_handle = NULL;
@@ -647,14 +702,37 @@ fail0:
 
 static esp_err_t deinit_web_cam_video(web_cam_video_t *video)
 {
+    if (video->producer_task) {
+        vTaskDelete(video->producer_task);
+        video->producer_task = NULL;
+    }
+
     if (video->sem) {
         vSemaphoreDelete(video->sem);
         video->sem = NULL;
     }
 
+    // free producer resources
+    if (video->out_bufs) {
+        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+            for (uint8_t i = 0; i < video->out_buf_count; i++) {
+                if (video->out_bufs[i]) free(video->out_bufs[i]);
+            }
+        } else {
+            for (uint8_t i = 0; i < video->out_buf_count; i++) {
+                if (video->out_bufs[i]) example_encoder_free_output_buffer(video->encoder_handle, video->out_bufs[i]);
+            }
+        }
+        free(video->out_bufs);
+        video->out_bufs = NULL;
+    }
+    if (video->frame_q) { vQueueDelete(video->frame_q); video->frame_q = NULL; }
+    if (video->free_q)  { vQueueDelete(video->free_q);  video->free_q = NULL; }
+    if (video->stream_lock) { vSemaphoreDelete(video->stream_lock); video->stream_lock = NULL; }
+
     if (video->pixel_format != V4L2_PIX_FMT_JPEG) {
-        example_encoder_free_output_buffer(video->encoder_handle, video->jpeg_out_buf);
         example_encoder_deinit(video->encoder_handle);
+        video->encoder_handle = NULL;
     }
 
     close(video->fd);
@@ -691,24 +769,33 @@ static esp_err_t new_web_cam(const web_cam_video_config_t *config, int config_co
 
     for (i = 0; i < config_count; i++) {
         if (is_valid_web_cam(&wc->video[i])) {
+            ESP_LOGI(TAG, "[PIPELINE_DEBUG] Iniciando streaming para video%d (fd=%d)...", i, wc->video[i].fd);
             ESP_GOTO_ON_ERROR(ioctl(wc->video[i].fd, VIDIOC_STREAMON, &type), fail1, TAG, "failed to start stream");
+            ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Streaming iniciado com sucesso!", i);
+        } else {
+            ESP_LOGW(TAG, "[PIPELINE_DEBUG] Video%d: Pulando - câmera inválida", i);
         }
     }
 
     *ret_wc = wc;
 
+    ESP_LOGI(TAG, "[PIPELINE_DEBUG] Webcam configurada com sucesso - %d câmeras ativas", config_count);
     return ESP_OK;
 
 fail1:
+    ESP_LOGE(TAG, "[PIPELINE_DEBUG] FALHA no STREAMON para video%d! Parando streams anteriores...", i);
     for (int j = i - 1; j >= 0; j--) {
         if (is_valid_web_cam(&wc->video[j])) {
+            ESP_LOGI(TAG, "[PIPELINE_DEBUG] Parando stream video%d...", j);
             ioctl(wc->video[j].fd, VIDIOC_STREAMOFF, &type);
         }
     }
     i = config_count; // deinit all web_cam
 fail0:
+    ESP_LOGE(TAG, "[PIPELINE_DEBUG] FALHA na inicialização! Limpando recursos...");
     for (int j = i - 1; j >= 0; j--) {
         if (is_valid_web_cam(&wc->video[j])) {
+            ESP_LOGI(TAG, "[PIPELINE_DEBUG] Desinicializando video%d...", j);
             deinit_web_cam_video(&wc->video[j]);
         }
     }
@@ -769,7 +856,7 @@ static esp_err_t http_server_init(web_cam_t *web_cam)
         .user_ctx = (void *)web_cam
     };
 
-    config.stack_size = 1024 * 6;
+    config.stack_size = 1024 * 8;
     ESP_LOGI(TAG, "Starting stream server on port: '%d'", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         /* Register API handlers (more specific URIs) */
@@ -794,7 +881,7 @@ static esp_err_t http_server_init(web_cam_t *web_cam)
             .user_ctx = (void *) &web_cam->video[i]
         };
 
-        config.stack_size = 1024 * 6;
+        config.stack_size = 1024 * 8;
         config.server_port += 1;
         config.ctrl_port += 1;
         if (httpd_start(&stream_httpd, &config) == ESP_OK) {
@@ -891,4 +978,215 @@ void app_main(void)
     ESP_ERROR_CHECK(start_cam_web_server(config, config_count));
 
     ESP_LOGI(TAG, "Camera web server starts");
+}
+static esp_err_t restart_video_stream(web_cam_video_t *video)
+{
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    struct v4l2_buffer buf;
+    ESP_LOGW(TAG, "[RECOVER] Reiniciando stream video%d", video->index);
+
+    // Stop streaming
+    int r = ioctl(video->fd, VIDIOC_STREAMOFF, &type);
+    if (r != 0) {
+        ESP_LOGE(TAG, "[RECOVER] STREAMOFF falhou errno=%d", errno);
+    }
+
+    // Requeue all mmapped buffers
+    for (uint32_t i = 0; i < video->buffer_count; i++) {
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        
+        buf.index  = i;
+        if (ioctl(video->fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[RECOVER] QBUF falhou no buffer %lu", (unsigned long)i);
+        }
+    }
+
+    // Start streaming again
+    if (ioctl(video->fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "[RECOVER] STREAMON falhou errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "[RECOVER] Stream reiniciado video%d", video->index);
+    return ESP_OK;
+}
+
+static void producer_task(void *arg)
+{
+    web_cam_video_t *video = (web_cam_video_t *)arg;
+    struct v4l2_buffer buf;
+    int select_timeout_count = 0;
+    video->last_pub_us = esp_timer_get_time();
+    video->meas_frames_window = 0;
+    video->meas_window_start_us = video->last_pub_us;
+    int64_t last_restart_us = 0;
+
+    for (;;) {
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        // Time-based stall watchdog: if no publications for >3s, force restart
+        {
+            int64_t now_watch = esp_timer_get_time();
+            if (now_watch - video->last_pub_us > 3000000) {
+                if (now_watch - last_restart_us > 2000000) { // avoid thrash
+                    ESP_LOGW(TAG, "[PROD] video%d watchdog: >3s sem publicações, restart", video->index);
+                    if (restart_video_stream(video) == ESP_OK) {
+                        video->stats_recoveries++;
+                    } else {
+                        video->stats_restart_fail++;
+                    }
+                    last_restart_us = now_watch;
+                    continue;
+                }
+            }
+        }
+
+        // Use select() to avoid indefinite block on DQBUF (enables restart on stall)
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(video->fd, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms
+        int sr = select(video->fd + 1, &fds, NULL, NULL, &tv);
+        if (sr == 0) {
+            video->stats_select_timeouts++;
+            select_timeout_count++;
+            if (select_timeout_count % 10 == 0) {
+                ESP_LOGW(TAG, "[PROD] video%d select timeout x%d (free=%lu queued=%lu)",
+                         video->index, select_timeout_count,
+                         (unsigned long)uxQueueMessagesWaiting(video->free_q),
+                         (unsigned long)uxQueueMessagesWaiting(video->frame_q));
+            }
+            if (select_timeout_count >= 30) { // ~3s sem frames
+                ESP_LOGE(TAG, "[PROD] video%d sem frames por ~3s, tentando restart", video->index);
+                if (restart_video_stream(video) == ESP_OK) {
+                    video->stats_recoveries++;
+                } else {
+                    video->stats_restart_fail++;
+                }
+                select_timeout_count = 0;
+            }
+            continue;
+        } else if (sr < 0) {
+            ESP_LOGE(TAG, "[PROD] video%d select erro: %s", video->index, strerror(errno));
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        select_timeout_count = 0;
+
+        int64_t t0 = esp_timer_get_time();
+        int dq = ioctl(video->fd, VIDIOC_DQBUF, &buf);
+        int64_t t1 = esp_timer_get_time();
+        if (dq != 0) {
+            video->stats_dq_errors++;
+            ESP_LOGE(TAG, "[PROD] video%d DQBUF erro errno=%d (%s)", video->index, errno, strerror(errno));
+            if (restart_video_stream(video) == ESP_OK) {
+                video->stats_recoveries++;
+            } else {
+                video->stats_restart_fail++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        ESP_LOGD(TAG, "[PROD] video%d DQBUF idx=%d bytes=%lu dt=%lldus", video->index, (int)buf.index, (unsigned long)buf.bytesused, (long long)(t1 - t0));
+
+        if (!(buf.flags & V4L2_BUF_FLAG_DONE)) {
+            ioctl(video->fd, VIDIOC_QBUF, &buf);
+            continue;
+        }
+
+        // Acquire an output slot (or drop oldest)
+        uint8_t slot;
+        frame_item_t drop;
+        if (xQueueReceive(video->free_q, &slot, 0) != pdTRUE) {
+            if (xQueueReceive(video->frame_q, &drop, 0) == pdTRUE) {
+                slot = drop.slot; // reuse the oldest slot
+            } else {
+                // No slot available: drop this frame
+                ioctl(video->fd, VIDIOC_QBUF, &buf);
+                continue;
+            }
+        }
+
+        uint32_t out_size = 0;
+        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+            uint32_t len = buf.bytesused;
+            if (len > video->out_buf_size) len = video->out_buf_size;
+            memcpy(video->out_bufs[slot], video->buffer[buf.index], len);
+            out_size = len;
+        } else {
+            // Encode RAW -> JPEG
+            int64_t e0 = esp_timer_get_time();
+            if (xSemaphoreTake(video->sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+                // failed to get encoder, drop
+                xQueueSend(video->free_q, &slot, 0);
+                ioctl(video->fd, VIDIOC_QBUF, &buf);
+                continue;
+            }
+            esp_err_t enc_ret = example_encoder_process(video->encoder_handle, video->buffer[buf.index], video->buffer_size,
+                                        video->out_bufs[slot], video->out_buf_size, &out_size);
+            int64_t e1 = esp_timer_get_time();
+            if (enc_ret != ESP_OK) {
+                xSemaphoreGive(video->sem);
+                xQueueSend(video->free_q, &slot, 0);
+                ioctl(video->fd, VIDIOC_QBUF, &buf);
+                ESP_LOGE(TAG, "[PROD] video%d encode falhou", video->index);
+                continue;
+            }
+            xSemaphoreGive(video->sem);
+            ESP_LOGD(TAG, "[PROD] video%d encode OK size=%lu dt=%lldus", video->index, (unsigned long)out_size, (long long)(e1 - e0));
+        }
+
+        // Return the camera buffer ASAP
+        ioctl(video->fd, VIDIOC_QBUF, &buf);
+
+        // Publish the frame (or drop if queue full)
+        frame_item_t item = { .slot = slot, .size = out_size };
+        if (xQueueSend(video->frame_q, &item, 0) != pdTRUE) {
+            // shouldn't happen; return slot to free list
+            xQueueSend(video->free_q, &slot, 0);
+            video->stats_drops++;
+            ESP_LOGW(TAG, "[PROD] video%d frame_q cheia, drop (free=%lu queued=%lu)",
+                     video->index,
+                     (unsigned long)uxQueueMessagesWaiting(video->free_q),
+                     (unsigned long)uxQueueMessagesWaiting(video->frame_q));
+        } else {
+            video->stats_published++;
+            video->last_pub_us = esp_timer_get_time();
+            video->meas_frames_window++;
+            int64_t noww = video->last_pub_us;
+            int64_t win_dt = noww - video->meas_window_start_us;
+            if (win_dt >= 1000000) { // janela ~1s
+                uint32_t meas_fps = (uint32_t)(video->meas_frames_window * 1000000ULL / (uint64_t)win_dt);
+                if (video->expected_fps && (meas_fps + video->expected_fps/4) < video->expected_fps) {
+                    ESP_LOGW(TAG, "[PROD] video%d FPS medido=%lu, esperado=%lu (queda >25%%)",
+                             video->index, (unsigned long)meas_fps, (unsigned long)video->expected_fps);
+                } else {
+                    ESP_LOGD(TAG, "[PROD] video%d FPS medido=%lu, esperado=%lu",
+                             video->index, (unsigned long)meas_fps, (unsigned long)video->expected_fps);
+                }
+                video->meas_frames_window = 0;
+                video->meas_window_start_us = noww;
+            }
+            if ((video->stats_published % 30) == 0) {
+                UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+                ESP_LOGI(TAG, "[PROD] video%d pub=%lu drop=%lu dqerr=%lu recov=%lu selto=%lu free=%lu queued=%lu stackfree=%lu",
+                         video->index,
+                         (unsigned long)video->stats_published,
+                         (unsigned long)video->stats_drops,
+                         (unsigned long)video->stats_dq_errors,
+                         (unsigned long)video->stats_recoveries,
+                         (unsigned long)video->stats_select_timeouts,
+                         (unsigned long)uxQueueMessagesWaiting(video->free_q),
+                         (unsigned long)uxQueueMessagesWaiting(video->frame_q),
+                         (unsigned long)hw);
+            }
+        }
+    }
 }
