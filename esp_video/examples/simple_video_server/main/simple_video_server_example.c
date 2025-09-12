@@ -42,9 +42,17 @@
 
 #define EXAMPLE_PART_BOUNDARY               CONFIG_EXAMPLE_HTTP_PART_BOUNDARY
 
+// Optional JPEG m2m stage (V4L2): number of CAP buffers to map
+#define M2M_JPEG_CAP_COUNT  6
+
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" EXAMPLE_PART_BOUNDARY;
 static const char *STREAM_BOUNDARY = "\r\n--" EXAMPLE_PART_BOUNDARY "\r\n";
 static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
+
+#if CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE
+// Forward declaration for V4L2 JPEG control helper
+static esp_err_t set_codec_control(int fd, uint32_t ctrl_class, uint32_t id, int32_t value);
+#endif
 
 extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
 extern const uint8_t index_html_gz_end[] asm("_binary_index_html_gz_end");
@@ -98,6 +106,13 @@ typedef struct web_cam_video {
     uint32_t expected_fps;
     uint32_t meas_frames_window;
     int64_t  meas_window_start_us;
+
+    // Optional JPEG m2m device (hardware encoder via V4L2)
+    int       m2m_fd;
+    uint8_t  *m2m_cap_buf[M2M_JPEG_CAP_COUNT];
+    size_t    m2m_cap_len[M2M_JPEG_CAP_COUNT];
+    uint8_t   m2m_cap_count;
+    uint8_t   use_m2m_jpeg; // 1 if configured and initialized
 
     uint32_t width;
     uint32_t height;
@@ -262,7 +277,26 @@ static esp_err_t set_camera_jpeg_quality(web_cam_video_t *video, int quality)
     esp_err_t ret = ESP_OK;
     int quality_reset = quality;
 
-    if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+    if (video->use_m2m_jpeg) {
+        // Quality control via m2m JPEG device
+        // Clamp using generic 1..100 bounds if needed
+        if (quality < 1) quality_reset = 1;
+        if (quality > 100) quality_reset = 100;
+#if CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE
+        if (video->m2m_fd > 0) {
+            // Set V4L2 JPEG quality on the encoder
+            set_codec_control(video->m2m_fd, V4L2_CID_JPEG_CLASS, V4L2_CID_JPEG_COMPRESSION_QUALITY, quality_reset);
+            video->jpeg_quality = quality_reset;
+            video->support_control_jpeg_quality = 1;
+        } else {
+            video->support_control_jpeg_quality = 0;
+            ESP_LOGW(TAG, "video%d: m2m fd inválido para set quality", video->index);
+        }
+#else
+        video->support_control_jpeg_quality = 0;
+        ESP_LOGW(TAG, "video%d: m2m JPEG não habilitado no Kconfig", video->index);
+#endif
+    } else if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
         struct v4l2_ext_controls controls = {0};
         struct v4l2_ext_control control[1];
         struct v4l2_query_ext_ctrl qctrl = {0};
@@ -553,6 +587,25 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
         ESP_LOGW(TAG, "video%d: VIDIOC_S_PARM falhou (mantendo fps atual)", index);
     }
 
+    // Force camera to output YUV422 planar for m2m compatibility
+    // Get current format first to preserve width/height
+    struct v4l2_format fmt_cam = {0};
+    fmt_cam.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    (void)ioctl(fd, VIDIOC_G_FMT, &fmt_cam);
+    if (fmt_cam.fmt.pix.width == 0 || fmt_cam.fmt.pix.height == 0) {
+        // fallback defaults if driver didn't return size here
+        fmt_cam.fmt.pix.width = 1280;
+        fmt_cam.fmt.pix.height = 720;
+    }
+    struct v4l2_format sformat = {0};
+    sformat.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    sformat.fmt.pix.width = fmt_cam.fmt.pix.width;
+    sformat.fmt.pix.height = fmt_cam.fmt.pix.height;
+    sformat.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
+    if (ioctl(fd, VIDIOC_S_FMT, &sformat) != 0) {
+        ESP_LOGW(TAG, "video%d: VIDIOC_S_FMT(YUV422P) falhou; mantendo formato atual", index);
+    }
+
     memset(&req, 0, sizeof(req));
     req.count  = EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER;
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -602,16 +655,119 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
         video->support_control_jpeg_quality = 1;
     } else {
         ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Formato RAW detectado, configurando encoder JPEG...", index);
-        example_encoder_config_t encoder_config = {0};
+        // Try V4L2 m2m JPEG device first (hardware pipeline), fallback to example_encoder
+        video->use_m2m_jpeg = 0;
+#if CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE
+        do {
+            int m2m = open(ESP_VIDEO_JPEG_DEVICE_NAME, O_RDWR);
+            if (m2m < 0) {
+                ESP_LOGW(TAG, "video%d: JPEG m2m device open failed, fallback to SW/HW encoder API", index);
+                break;
+            }
+            // Non-blocking to prevent producer stalls on DQBUF
+            int nb_flags = fcntl(m2m, F_GETFL, 0);
+            if (nb_flags >= 0) {
+                fcntl(m2m, F_SETFL, nb_flags | O_NONBLOCK);
+            }
+            struct v4l2_capability cap = {0};
+            if (ioctl(m2m, VIDIOC_QUERYCAP, &cap) != 0) {
+                ESP_LOGW(TAG, "video%d: m2m querycap failed, fallback", index);
+                close(m2m);
+                break;
+            }
+            // Set quality
+            set_codec_control(m2m, V4L2_CID_JPEG_CLASS, V4L2_CID_JPEG_COMPRESSION_QUALITY, EXAMPLE_JPEG_ENC_QUALITY);
+            // Configure OUTPUT (USERPTR) with camera format
+            struct v4l2_format ofmt = {0};
+            ofmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            ofmt.fmt.pix.width = video->width;
+            ofmt.fmt.pix.height = video->height;
+            ofmt.fmt.pix.pixelformat = video->pixel_format;
+            if (ioctl(m2m, VIDIOC_S_FMT, &ofmt) != 0) {
+                ESP_LOGW(TAG, "video%d: m2m OUTPUT fmt failed, fallback", index);
+                close(m2m);
+                break;
+            }
+            struct v4l2_requestbuffers oreq = {0};
+            oreq.count = M2M_JPEG_CAP_COUNT; // mirror CAP depth to smooth pipeline
+            oreq.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            oreq.memory = V4L2_MEMORY_USERPTR;
+            if (ioctl(m2m, VIDIOC_REQBUFS, &oreq) != 0) {
+                ESP_LOGW(TAG, "video%d: m2m OUTPUT reqbufs failed, fallback", index);
+                close(m2m);
+                break;
+            }
+            // Configure CAPTURE (MMAP) as JPEG
+            struct v4l2_format cfmt = {0};
+            cfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            cfmt.fmt.pix.width = video->width;
+            cfmt.fmt.pix.height = video->height;
+            cfmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+            if (ioctl(m2m, VIDIOC_S_FMT, &cfmt) != 0) {
+                ESP_LOGW(TAG, "video%d: m2m CAPTURE fmt failed, fallback", index);
+                close(m2m);
+                break;
+            }
+            struct v4l2_requestbuffers creq = {0};
+            creq.count = M2M_JPEG_CAP_COUNT;
+            creq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            creq.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(m2m, VIDIOC_REQBUFS, &creq) != 0) {
+                ESP_LOGW(TAG, "video%d: m2m CAPTURE reqbufs failed, fallback", index);
+                close(m2m);
+                break;
+            }
+            // Map and queue CAPTURE buffers
+            for (uint8_t i = 0; i < M2M_JPEG_CAP_COUNT; i++) {
+                struct v4l2_buffer b = {0};
+                b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                b.memory = V4L2_MEMORY_MMAP;
+                b.index = i;
+                if (ioctl(m2m, VIDIOC_QUERYBUF, &b) != 0) {
+                    ESP_LOGW(TAG, "video%d: m2m QUERYBUF failed, fallback", index);
+                    close(m2m);
+                    m2m = -1; break;
+                }
+                video->m2m_cap_buf[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, m2m, b.m.offset);
+                if (video->m2m_cap_buf[i] == MAP_FAILED) {
+                    ESP_LOGW(TAG, "video%d: m2m mmap failed, fallback", index);
+                    close(m2m);
+                    m2m = -1; break;
+                }
+                video->m2m_cap_len[i] = b.length;
+                memset(&b, 0, sizeof(b));
+                b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                b.memory = V4L2_MEMORY_MMAP;
+                b.index = i;
+                if (ioctl(m2m, VIDIOC_QBUF, &b) != 0) {
+                    ESP_LOGW(TAG, "video%d: m2m QBUF CAP failed, fallback", index);
+                    close(m2m);
+                    m2m = -1; break;
+                }
+            }
+            if (m2m < 0) {
+                // mapping failed earlier
+            } else {
+                int type = V4L2_BUF_TYPE_VIDEO_CAPTURE; ioctl(m2m, VIDIOC_STREAMON, &type);
+                type = V4L2_BUF_TYPE_VIDEO_OUTPUT; ioctl(m2m, VIDIOC_STREAMON, &type);
+                video->m2m_fd = m2m;
+                video->m2m_cap_count = M2M_JPEG_CAP_COUNT;
+                video->use_m2m_jpeg = 1;
+                ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: JPEG m2m enabled", index);
+            }
+        } while (0);
+#endif // CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE
 
-        encoder_config.width = video->width;
-        encoder_config.height = video->height;
-        encoder_config.pixel_format = video->pixel_format;
-        encoder_config.quality = EXAMPLE_JPEG_ENC_QUALITY;
-        ESP_GOTO_ON_ERROR(example_encoder_init(&encoder_config, &video->encoder_handle), fail0, TAG, "failed to init encoder");
-
-        // We'll allocate multiple output buffers below for producer
-        ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Encoder configurado", index);
+        if (!video->use_m2m_jpeg) {
+            // Fallback to example_encoder (HW JPEG engine or SW, depending on Kconfig)
+            example_encoder_config_t encoder_config = {0};
+            encoder_config.width = video->width;
+            encoder_config.height = video->height;
+            encoder_config.pixel_format = video->pixel_format;
+            encoder_config.quality = EXAMPLE_JPEG_ENC_QUALITY;
+            ESP_GOTO_ON_ERROR(example_encoder_init(&encoder_config, &video->encoder_handle), fail0, TAG, "failed to init encoder");
+            ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Encoder API configurado", index);
+        }
 
         video->support_control_jpeg_quality = 1;
     }
@@ -634,8 +790,17 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
     video->out_bufs = (uint8_t **)calloc(out_count, sizeof(uint8_t *));
     ESP_GOTO_ON_FALSE(video->out_bufs, ESP_ERR_NO_MEM, fail5, TAG, "failed to alloc out_bufs array");
 
-    if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
-        video->out_buf_size = video->buffer_size;
+    if (video->use_m2m_jpeg || video->pixel_format == V4L2_PIX_FMT_JPEG) {
+        // For m2m path, size output buffers from CAP buffer lengths
+        if (video->use_m2m_jpeg) {
+            size_t max_cap = 0;
+            for (uint8_t i = 0; i < video->m2m_cap_count; i++) {
+                if (video->m2m_cap_len[i] > max_cap) max_cap = video->m2m_cap_len[i];
+            }
+            video->out_buf_size = (uint32_t)max_cap;
+        } else {
+            video->out_buf_size = video->buffer_size;
+        }
         for (uint8_t i = 0; i < out_count; i++) {
             video->out_bufs[i] = (uint8_t *)malloc(video->out_buf_size);
             ESP_GOTO_ON_FALSE(video->out_bufs[i], ESP_ERR_NO_MEM, fail6, TAG, "failed to alloc jpeg out buf");
@@ -671,7 +836,7 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
 
 fail6:
     if (video->out_bufs) {
-        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+        if (video->use_m2m_jpeg || video->pixel_format == V4L2_PIX_FMT_JPEG) {
             for (uint8_t i = 0; i < out_count; i++) {
                 if (video->out_bufs[i]) free(video->out_bufs[i]);
             }
@@ -690,7 +855,7 @@ fail4:
 fail3:
     if (video->frame_q) { vQueueDelete(video->frame_q); video->frame_q = NULL; }
 fail2:
-    if (video->pixel_format != V4L2_PIX_FMT_JPEG) {
+    if (!video->use_m2m_jpeg && video->encoder_handle) {
         example_encoder_deinit(video->encoder_handle);
         video->encoder_handle = NULL;
     }
@@ -713,8 +878,20 @@ static esp_err_t deinit_web_cam_video(web_cam_video_t *video)
     }
 
     // free producer resources
+    if (video->use_m2m_jpeg && video->m2m_fd > 0) {
+        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT; ioctl(video->m2m_fd, VIDIOC_STREAMOFF, &type);
+        type = V4L2_BUF_TYPE_VIDEO_CAPTURE; ioctl(video->m2m_fd, VIDIOC_STREAMOFF, &type);
+        for (uint8_t i = 0; i < video->m2m_cap_count; i++) {
+            if (video->m2m_cap_buf[i]) munmap(video->m2m_cap_buf[i], video->m2m_cap_len[i]);
+            video->m2m_cap_buf[i] = NULL;
+            video->m2m_cap_len[i] = 0;
+        }
+        close(video->m2m_fd);
+        video->m2m_fd = -1;
+        video->use_m2m_jpeg = 0;
+    }
     if (video->out_bufs) {
-        if (video->pixel_format == V4L2_PIX_FMT_JPEG) {
+        if (video->use_m2m_jpeg || video->pixel_format == V4L2_PIX_FMT_JPEG) {
             for (uint8_t i = 0; i < video->out_buf_count; i++) {
                 if (video->out_bufs[i]) free(video->out_bufs[i]);
             }
@@ -730,7 +907,7 @@ static esp_err_t deinit_web_cam_video(web_cam_video_t *video)
     if (video->free_q)  { vQueueDelete(video->free_q);  video->free_q = NULL; }
     if (video->stream_lock) { vSemaphoreDelete(video->stream_lock); video->stream_lock = NULL; }
 
-    if (video->pixel_format != V4L2_PIX_FMT_JPEG) {
+    if (!video->use_m2m_jpeg && video->encoder_handle) {
         example_encoder_deinit(video->encoder_handle);
         video->encoder_handle = NULL;
     }
@@ -1120,6 +1297,60 @@ static void producer_task(void *arg)
             if (len > video->out_buf_size) len = video->out_buf_size;
             memcpy(video->out_bufs[slot], video->buffer[buf.index], len);
             out_size = len;
+        } else if (video->use_m2m_jpeg) {
+            // m2m JPEG: Q camera buffer pointer to m2m OUTPUT, DQ m2m CAPTURE
+            struct v4l2_buffer mout = {0};
+            mout.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            mout.memory = V4L2_MEMORY_USERPTR;
+            mout.index = 0; // index is not significant for USERPTR path
+            mout.m.userptr = (unsigned long)video->buffer[buf.index];
+            mout.length = buf.bytesused;
+            mout.bytesused = buf.bytesused;
+            if (ioctl(video->m2m_fd, VIDIOC_QBUF, &mout) != 0) {
+                // fail safe: drop
+                xQueueSend(video->free_q, &slot, 0);
+                ioctl(video->fd, VIDIOC_QBUF, &buf);
+                continue;
+            }
+            struct v4l2_buffer mcap = {0};
+            mcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            mcap.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(video->m2m_fd, VIDIOC_DQBUF, &mcap) != 0) {
+                // Non-blocking path: if no data ready, drop this frame to avoid stalls
+                if (errno == EAGAIN) {
+                    // Clean OUTPUT if any buffer completed
+                    struct v4l2_buffer mout_clean = {0};
+                    mout_clean.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+                    mout_clean.memory = V4L2_MEMORY_USERPTR;
+                    (void)ioctl(video->m2m_fd, VIDIOC_DQBUF, &mout_clean);
+                    xQueueSend(video->free_q, &slot, 0);
+                    ioctl(video->fd, VIDIOC_QBUF, &buf);
+                    continue;
+                }
+                // Other errors: drop and continue
+                struct v4l2_buffer mout_clean = {0};
+                mout_clean.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+                mout_clean.memory = V4L2_MEMORY_USERPTR;
+                (void)ioctl(video->m2m_fd, VIDIOC_DQBUF, &mout_clean);
+                xQueueSend(video->free_q, &slot, 0);
+                ioctl(video->fd, VIDIOC_QBUF, &buf);
+                continue;
+            }
+            uint32_t len = mcap.bytesused;
+            if (len > video->out_buf_size) len = video->out_buf_size;
+            memcpy(video->out_bufs[slot], video->m2m_cap_buf[mcap.index], len);
+            out_size = len;
+            // return m2m CAP buffer
+            struct v4l2_buffer mcap_ret = {0};
+            mcap_ret.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            mcap_ret.memory = V4L2_MEMORY_MMAP;
+            mcap_ret.index = mcap.index;
+            ioctl(video->m2m_fd, VIDIOC_QBUF, &mcap_ret);
+            // clean m2m OUTPUT userptr
+            struct v4l2_buffer mout_clean2 = {0};
+            mout_clean2.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            mout_clean2.memory = V4L2_MEMORY_USERPTR;
+            ioctl(video->m2m_fd, VIDIOC_DQBUF, &mout_clean2);
         } else {
             // Encode RAW -> JPEG
             int64_t e0 = esp_timer_get_time();
@@ -1190,3 +1421,22 @@ static void producer_task(void *arg)
         }
     }
 }
+
+// Minimal helper to set V4L2 ext controls (used for JPEG m2m quality)
+#if CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE
+static esp_err_t set_codec_control(int fd, uint32_t ctrl_class, uint32_t id, int32_t value)
+{
+    struct v4l2_ext_controls controls = {0};
+    struct v4l2_ext_control control[1] = {0};
+    controls.ctrl_class = ctrl_class;
+    controls.count = 1;
+    controls.controls = control;
+    control[0].id = id;
+    control[0].value = value;
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+        ESP_LOGW(TAG, "failed to set control: %" PRIu32, id);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+#endif
