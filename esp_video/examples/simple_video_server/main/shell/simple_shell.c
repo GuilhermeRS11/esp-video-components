@@ -19,7 +19,9 @@
 #include "nvs_flash.h"
 #include "simple_shell.h"
 #include "camera_shell.h"
+#if CONFIG_CAMERA_IMX708
 #include "imx708_hardware_shell.h"
+#endif
 
 static const char* TAG = "simple_shell";
 
@@ -259,8 +261,10 @@ void simple_shell_start(void)
     // Register camera control commands
     camera_shell_register_commands();
     
-    // Register IMX708 hardware register control commands
+    // Register IMX708 hardware register control commands (only if IMX708 is enabled)
+#if CONFIG_CAMERA_IMX708
     imx708_hardware_shell_register_commands();
+#endif
     
     shell_running = true;
     

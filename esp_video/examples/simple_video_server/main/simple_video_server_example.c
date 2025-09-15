@@ -43,7 +43,7 @@
 #define EXAMPLE_PART_BOUNDARY               CONFIG_EXAMPLE_HTTP_PART_BOUNDARY
 
 // Optional JPEG m2m stage (V4L2): number of CAP buffers to map
-#define M2M_JPEG_CAP_COUNT  5
+#define M2M_JPEG_CAP_COUNT  CONFIG_EXAMPLE_M2M_CAP_COUNT
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" EXAMPLE_PART_BOUNDARY;
 static const char *STREAM_BOUNDARY = "\r\n--" EXAMPLE_PART_BOUNDARY "\r\n";
@@ -79,8 +79,6 @@ typedef struct web_cam_video {
     const char *dev_name;
 
     example_encoder_handle_t encoder_handle;
-    uint8_t *jpeg_out_buf;      // legacy single buffer (unused in streaming)
-    uint32_t jpeg_out_size;     // legacy single buffer size
 
     uint8_t *buffer[EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER];
     uint32_t buffer_size;
@@ -504,11 +502,13 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
         xQueueSend(video->free_q, &slot, portMAX_DELAY);
 
         sent_count++;
+#if CONFIG_EXAMPLE_PERF_LOGS
         if ((sent_count % 30) == 0) {
             ESP_LOGI(TAG, "[HTTP] video%d sent=%lu (free=%lu queued=%lu)", video->index, (unsigned long)sent_count,
                      (unsigned long)uxQueueMessagesWaiting(video->free_q),
                      (unsigned long)uxQueueMessagesWaiting(video->frame_q));
         }
+#endif
     }
 
     // not reached
@@ -539,19 +539,7 @@ static esp_err_t capture_image_handler(httpd_req_t *req)
     return capture_video_image(req, &web_cam->video[desc.index], true);
 }
 
-static esp_err_t capture_binary_handler(httpd_req_t *req)
-{
-    web_cam_t *web_cam = (web_cam_t *)req->user_ctx;
-
-    request_desc_t desc;
-    ESP_RETURN_ON_ERROR(decode_request(web_cam, req, &desc), TAG, "failed to decode request");
-
-    char type_ptr[56];
-    ESP_RETURN_ON_FALSE(snprintf(type_ptr, sizeof(type_ptr), "application/octet-stream;name=image_binary%d.bin", desc.index) > 0, ESP_FAIL, TAG, "failed to format buffer");
-    ESP_RETURN_ON_ERROR(httpd_resp_set_type(req, type_ptr), TAG, "failed to set content type");
-
-    return capture_video_image(req, &web_cam->video[desc.index], false);
-}
+/* removed capture_binary_handler: duplicate of capture_image_handler (always JPEG) */
 
 static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_config_t *config, int index)
 {
@@ -767,12 +755,14 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
         video->support_control_jpeg_quality = 1;
     }
 
-    video->sem = xSemaphoreCreateBinary();
-    ESP_GOTO_ON_FALSE(video->sem, ESP_ERR_NO_MEM, fail2, TAG, "failed to create semaphore");
-    xSemaphoreGive(video->sem);
+    if (!video->use_m2m_jpeg) {
+        video->sem = xSemaphoreCreateBinary();
+        ESP_GOTO_ON_FALSE(video->sem, ESP_ERR_NO_MEM, fail2, TAG, "failed to create semaphore");
+        xSemaphoreGive(video->sem);
+    }
 
     // Create producer resources (queues, buffers, task, stream lock)
-    const uint8_t out_count = 4; // queue depth / number of encoded buffers
+    const uint8_t out_count = CONFIG_EXAMPLE_ENCODED_QUEUE_DEPTH; // queue depth / number of encoded buffers
     video->out_buf_count = out_count;
     video->frame_q = xQueueCreate(out_count, sizeof(frame_item_t));
     ESP_GOTO_ON_FALSE(video->frame_q, ESP_ERR_NO_MEM, fail2, TAG, "failed to create frame_q");
@@ -1007,13 +997,6 @@ static esp_err_t http_server_init(web_cam_t *web_cam)
         .user_ctx = (void *)web_cam
     };
 
-    httpd_uri_t capture_binary_uri = {
-        .uri = "/api/capture_binary",
-        .method = HTTP_GET,
-        .handler = capture_binary_handler,
-        .user_ctx = (void *)web_cam
-    };
-
     httpd_uri_t camera_info_uri = {
         .uri = "/api/get_camera_info",
         .method = HTTP_GET,
@@ -1033,7 +1016,6 @@ static esp_err_t http_server_init(web_cam_t *web_cam)
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         /* Register API handlers (more specific URIs) */
         httpd_register_uri_handler(stream_httpd, &capture_image_uri);
-        httpd_register_uri_handler(stream_httpd, &capture_binary_uri);
         httpd_register_uri_handler(stream_httpd, &camera_info_uri);
         httpd_register_uri_handler(stream_httpd, &camera_settings_uri);
 
@@ -1190,7 +1172,6 @@ static void producer_task(void *arg)
 {
     web_cam_video_t *video = (web_cam_video_t *)arg;
     struct v4l2_buffer buf;
-    int select_timeout_count = 0;
     video->last_pub_us = esp_timer_get_time();
     video->meas_frames_window = 0;
     video->meas_window_start_us = video->last_pub_us;
@@ -1346,18 +1327,16 @@ static void producer_task(void *arg)
             int64_t noww = video->last_pub_us;
             int64_t win_dt = noww - video->meas_window_start_us;
             if (win_dt >= 1000000) { // ~1s window
+#if CONFIG_EXAMPLE_PERF_LOGS
                 uint32_t meas_fps = (uint32_t)(video->meas_frames_window * 1000000ULL / (uint64_t)win_dt);
-                if (video->expected_fps && (meas_fps + video->expected_fps/4) < video->expected_fps) {
-                    ESP_LOGW(TAG, "[PROD] video%d measured FPS=%lu, expected=%lu (drop >25%%)",
-                             video->index, (unsigned long)meas_fps, (unsigned long)video->expected_fps);
-                } else {
-                    ESP_LOGD(TAG, "[PROD] video%d measured FPS=%lu, expected=%lu",
-                             video->index, (unsigned long)meas_fps, (unsigned long)video->expected_fps);
-                }
+                ESP_LOGD(TAG, "[PROD] video%d measured FPS=%lu, expected=%lu",
+                         video->index, (unsigned long)meas_fps, (unsigned long)video->expected_fps);
+#endif
                 video->meas_frames_window = 0;
                 video->meas_window_start_us = noww;
             }
-            if ((video->stats_published % 30) == 0) {
+            if ((video->stats_published % 60) == 0) {
+#if CONFIG_EXAMPLE_PERF_LOGS
                 UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
                 ESP_LOGI(TAG, "[PROD] video%d pub=%lu drop=%lu dqerr=%lu recov=%lu selto=%lu free=%lu queued=%lu stackfree=%lu",
                          video->index,
@@ -1369,6 +1348,7 @@ static void producer_task(void *arg)
                          (unsigned long)uxQueueMessagesWaiting(video->free_q),
                          (unsigned long)uxQueueMessagesWaiting(video->frame_q),
                          (unsigned long)hw);
+#endif
             }
         }
     }

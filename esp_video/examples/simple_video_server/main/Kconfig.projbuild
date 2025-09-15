@@ -61,3 +61,30 @@ menu "Example Configuration"
             accessed as "esp-web.local" on the local network (if mDNS is supported
             by the client device).
 endmenu
+
+menu "Advanced Example Options"
+
+    config EXAMPLE_PERF_LOGS
+        bool "Enable performance logs (FPS, watchdog summaries)"
+        default n
+        help
+            When enabled, producer prints additional performance diagnostics.
+            Keep disabled for cleaner output in production.
+
+    config EXAMPLE_ENCODED_QUEUE_DEPTH
+        int "Encoded output queue depth"
+        range 2 32
+        default 10
+        help
+            Number of encoded frame buffers (producer/consumer queue depth).
+            Higher values add elasticity but use more memory.
+
+    config EXAMPLE_M2M_CAP_COUNT
+        int "m2m JPEG CAP buffer count"
+        range 4 16
+        default 10
+        help
+            Number of CAPTURE (MMAP) buffers to map on the m2m JPEG device.
+            Increase if you see encoder backpressure.
+
+endmenu
