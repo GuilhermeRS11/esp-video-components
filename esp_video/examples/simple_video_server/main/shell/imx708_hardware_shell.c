@@ -304,6 +304,12 @@ static int cmd_hw_light_profile(int argc, char **argv)
  */
 static int cmd_hw_registers_dump(int argc, char **argv)
 {
+    // Refuse to run while streaming is active to avoid SCCB contention and stalls
+    printf("IMX708 hardware register dump is disabled during streaming. Stop the stream first.\n");
+    return 1;
+
+    // The detailed dump below is intentionally disabled in streaming mode.
+    // If needed for offline diagnostics, re-enable after stopping the pipeline.
     printf("IMX708 Hardware Registers Status:\n");
     printf("=====================================\n");
     

@@ -12,6 +12,8 @@
 #include "esp_log.h"
 
 #include "esp_cam_sensor.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_cam_sensor_detect.h"
 #include "esp_sccb_intf.h"
 #include "imx708_regs.h"
@@ -1908,6 +1910,26 @@ err_free_handler:
 
 // Global reference to the IMX708 device for hardware register access
 static esp_cam_sensor_device_t *g_imx708_device = NULL;
+static SemaphoreHandle_t s_imx708_sccb_mutex = NULL;
+
+static inline bool imx708_sccb_lock(TickType_t ticks)
+{
+    if (s_imx708_sccb_mutex == NULL) {
+        // Lazy create
+        s_imx708_sccb_mutex = xSemaphoreCreateMutex();
+        if (s_imx708_sccb_mutex == NULL) {
+            return false;
+        }
+    }
+    return xSemaphoreTake(s_imx708_sccb_mutex, ticks) == pdTRUE;
+}
+
+static inline void imx708_sccb_unlock(void)
+{
+    if (s_imx708_sccb_mutex) {
+        xSemaphoreGive(s_imx708_sccb_mutex);
+    }
+}
 
 /**
  * @brief Set global IMX708 device reference for hardware access
@@ -1917,6 +1939,12 @@ void imx708_set_global_device(esp_cam_sensor_device_t *device)
 {
     g_imx708_device = device;
     ESP_LOGI(TAG, "IMX708 global device reference set for hardware access");
+    if (s_imx708_sccb_mutex == NULL) {
+        s_imx708_sccb_mutex = xSemaphoreCreateMutex();
+        if (!s_imx708_sccb_mutex) {
+            ESP_LOGW(TAG, "Failed to create IMX708 SCCB mutex");
+        }
+    }
 }
 
 /**
@@ -1929,8 +1957,15 @@ esp_err_t imx708_hw_write_register(uint16_t reg, uint8_t value)
         ESP_LOGE(TAG, "IMX708 device not initialized for hardware access");
         return ESP_ERR_INVALID_STATE;
     }
-    
+
+    // Try to acquire SCCB quickly; avoid blocking streaming for long
+    if (!imx708_sccb_lock(pdMS_TO_TICKS(10))) {
+        ESP_LOGW(TAG, "IMX708 SCCB busy, write 0x%04X skipped", reg);
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t ret = imx708_write(g_imx708_device->sccb_handle, reg, value);
+    imx708_sccb_unlock();
     if (ret == ESP_OK) {
         ESP_LOGD(TAG, "IMX708 HW Write: 0x%04X = 0x%02X", reg, value);
     } else {
@@ -1955,8 +1990,14 @@ esp_err_t imx708_hw_read_register(uint16_t reg, uint8_t *value)
         ESP_LOGE(TAG, "IMX708 HW Read: NULL value pointer");
         return ESP_ERR_INVALID_ARG;
     }
-    
+
+    if (!imx708_sccb_lock(pdMS_TO_TICKS(10))) {
+        ESP_LOGW(TAG, "IMX708 SCCB busy, read 0x%04X skipped", reg);
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t ret = imx708_read(g_imx708_device->sccb_handle, reg, value);
+    imx708_sccb_unlock();
     if (ret == ESP_OK) {
         ESP_LOGD(TAG, "IMX708 HW Read: 0x%04X = 0x%02X", reg, *value);
     } else {
