@@ -275,8 +275,8 @@ static const imx708_reginfo_t imx708_1280x720_regs[] = {
 static const imx708_reginfo_t imx708_800x640_regs[] = {
     {0x0342, 0x2F},  // LINE_LENGTH_PCK - Adjusted for centered crop: 12000
     {0x0343, 0x00},
-    {0x0340, 0x04},  // FRM_LENGTH_LINES - Adjusted for 15fps: 1013  
-    {0x0341, 0xF5},
+    {0x0340, 0x0C},  // FRM_LENGTH_LINES - tuned for 15fps with long exposure support: 3296
+    {0x0341, 0xE0},
     {0x0344, 0x05},  // X_ADDR_START - Centered crop start: 1504
     {0x0345, 0xE0},
     {0x0346, 0x02},  // Y_ADDR_START - Centered crop start: 656  
@@ -351,3 +351,4 @@ static const imx708_reginfo_t imx708_link_freq_453mhz[] = {
 #ifdef __cplusplus
 }
 #endif
+

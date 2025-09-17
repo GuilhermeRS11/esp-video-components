@@ -105,6 +105,10 @@ typedef struct web_cam_video {
     uint32_t meas_frames_window;
     int64_t  meas_window_start_us;
 
+    // Sensor timing diagnostics
+    uint32_t dq_fps_samples;
+    int64_t  dq_last_us;
+
     // Optional JPEG m2m device (hardware encoder via V4L2)
     int       m2m_fd;
     uint8_t  *m2m_cap_buf[M2M_JPEG_CAP_COUNT];
@@ -470,6 +474,8 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
     while (1) {
         int hlen;
         struct timespec ts;
+        static const TickType_t frame_delay_ticks = pdMS_TO_TICKS(67);
+        static TickType_t last_tick = 0;
 
         // Wait for next produced frame
         if (xQueueReceive(video->frame_q, &item, pdMS_TO_TICKS(500)) != pdTRUE) {
@@ -489,13 +495,34 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
         }
         empty_polls = 0;
 
+        // Throttle to ~15 fps to avoid overwhelming client
+        TickType_t now_ticks = xTaskGetTickCount();
+        if (last_tick != 0) {
+            TickType_t elapsed = now_ticks - last_tick;
+            if (elapsed < frame_delay_ticks) {
+                vTaskDelay(frame_delay_ticks - elapsed);
+                now_ticks = xTaskGetTickCount();
+            }
+        }
+        last_tick = now_ticks;
+
         // Send multipart headers + JPEG
         ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)), fail0, TAG, "failed to send boundary");
         ESP_GOTO_ON_ERROR(clock_gettime(CLOCK_MONOTONIC, &ts), fail0, TAG, "failed to get time");
         ESP_GOTO_ON_FALSE((hlen = snprintf(http_string, sizeof(http_string), STREAM_PART, (unsigned int)item.size, ts.tv_sec, ts.tv_nsec)) > 0,
                           ESP_FAIL, fail0, TAG, "failed to format part buffer");
-        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, http_string, hlen), fail0, TAG, "failed to send part header");
-        ESP_GOTO_ON_ERROR(httpd_resp_send_chunk(req, (char *)video->out_bufs[item.slot], item.size), fail0, TAG, "failed to send jpeg");
+        if (httpd_resp_send_chunk(req, http_string, hlen) != ESP_OK) {
+            ESP_LOGW(TAG, "[HTTP] video%d header send blocked, dropping frame", video->index);
+            uint8_t slot = item.slot;
+            xQueueSend(video->free_q, &slot, portMAX_DELAY);
+            continue;
+        }
+        if (httpd_resp_send_chunk(req, (char *)video->out_bufs[item.slot], item.size) != ESP_OK) {
+            ESP_LOGW(TAG, "[HTTP] video%d payload send blocked, dropping frame", video->index);
+            uint8_t slot = item.slot;
+            xQueueSend(video->free_q, &slot, portMAX_DELAY);
+            continue;
+        }
 
         // Return slot to free list
         uint8_t slot = item.slot;
@@ -1217,6 +1244,21 @@ static void producer_task(void *arg)
         }
         ESP_LOGD(TAG, "[PROD] video%d DQBUF idx=%d bytes=%lu dt=%lldus", video->index, (int)buf.index, (unsigned long)buf.bytesused, (long long)(t1 - t0));
 
+        if (video->dq_fps_samples < 30) {
+            if (video->dq_last_us != 0) {
+                int64_t dt = t1 - video->dq_last_us;
+                if (dt > 0) {
+                    float dq_fps = 1000000.0f / (float)dt;
+                    ESP_LOGI(TAG, "[PROD] video%d sensor frame %lu -> %.2f fps (raw)",
+                             video->index,
+                             (unsigned long)(video->dq_fps_samples + 1),
+                             dq_fps);
+                }
+            }
+            video->dq_last_us = t1;
+            video->dq_fps_samples++;
+        }
+
         if (!(buf.flags & V4L2_BUF_FLAG_DONE)) {
             ioctl(video->fd, VIDIOC_QBUF, &buf);
             continue;
@@ -1312,17 +1354,44 @@ static void producer_task(void *arg)
 
         // Publish the frame (or drop if queue full)
         frame_item_t item = { .slot = slot, .size = out_size };
+
+        // Drop oldest frame if queue is full to avoid stalling HTTP
         if (xQueueSend(video->frame_q, &item, 0) != pdTRUE) {
-            // shouldn't happen; return slot to free list
-            xQueueSend(video->free_q, &slot, 0);
-            video->stats_drops++;
-            ESP_LOGW(TAG, "[PROD] video%d frame_q full, drop (free=%lu queued=%lu)",
-                     video->index,
-                     (unsigned long)uxQueueMessagesWaiting(video->free_q),
-                     (unsigned long)uxQueueMessagesWaiting(video->frame_q));
-        } else {
+            frame_item_t oldest;
+            if (xQueueReceive(video->frame_q, &oldest, 0) == pdTRUE) {
+                // return slot of the dropped frame
+                xQueueSend(video->free_q, &oldest.slot, 0);
+                video->stats_drops++;
+                ESP_LOGW(TAG, "[PROD] video%d drop oldest (free=%lu queued=%lu)",
+                         video->index,
+                         (unsigned long)uxQueueMessagesWaiting(video->free_q),
+                         (unsigned long)uxQueueMessagesWaiting(video->frame_q));
+            }
+            // retry enqueue (should succeed now)
+            if (xQueueSend(video->frame_q, &item, 0) != pdTRUE) {
+                // give up: return slot to free list
+                xQueueSend(video->free_q, &slot, 0);
+                continue;
+            }
+        }
+
+        {
             video->stats_published++;
-            video->last_pub_us = esp_timer_get_time();
+            if (video->stats_published <= 30) {
+                int64_t now_us = esp_timer_get_time();
+                int64_t delta_us = now_us - video->last_pub_us;
+                if (delta_us > 0) {
+                    float inst_fps = 1000000.0f / (float)delta_us;
+                    ESP_LOGI(TAG, "[PROD] video%d early frame %lu -> %.2f fps", video->index,
+                             (unsigned long)video->stats_published, inst_fps);
+                }
+                video->last_pub_us = now_us;
+            } else if (video->stats_published == 31) {
+                // reset last_pub_us to maintain existing watchdog timing
+                video->last_pub_us = esp_timer_get_time();
+            } else {
+                video->last_pub_us = esp_timer_get_time();
+            }
             video->meas_frames_window++;
             int64_t noww = video->last_pub_us;
             int64_t win_dt = noww - video->meas_window_start_us;

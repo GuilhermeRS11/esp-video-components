@@ -180,9 +180,9 @@ static const esp_cam_sensor_isp_info_t imx708_isp_info[] = {
     {
         .isp_v1_info = {
             .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
-            .pclk = 182400000,
-            .vts = 1013,           // Updated for centered crop timing
-            .hts = 12000,          // Updated for centered crop timing  
+            .pclk = 595200000,
+            .vts = 3296,
+            .hts = 12032,
             .bayer_type = ESP_CAM_SENSOR_BAYER_RGGB,  // Correto: RGGB
         }
     }
@@ -1039,7 +1039,16 @@ static esp_err_t imx708_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_se
         qdesc->number.step = 1;
         qdesc->default_value = 0;
         break;
-        
+
+    case ESP_CAM_SENSOR_DATA_SEQ:
+        qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_NUMBER;
+        qdesc->number.minimum = ESP_CAM_SENSOR_DATA_SEQ_NONE;
+        qdesc->number.maximum = ESP_CAM_SENSOR_DATA_SEQ_NONE;
+        qdesc->number.step = 1;
+        qdesc->default_value = ESP_CAM_SENSOR_DATA_SEQ_NONE;
+        qdesc->flags = ESP_CAM_SENSOR_PARAM_FLAG_READ_ONLY;
+        break;
+
     // Color Balance Controls
     case IMX708_COLOR_BALANCE_RED:
         qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_NUMBER;
@@ -1158,7 +1167,12 @@ static esp_err_t imx708_get_para_value(esp_cam_sensor_device_t *dev, uint32_t id
         ESP_RETURN_ON_FALSE(size == sizeof(uint32_t), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for DGAIN");
         *(uint32_t *)arg = cam_imx708->imx708_para.digital_gain;
         break;
-        
+
+    case ESP_CAM_SENSOR_DATA_SEQ:
+        ESP_RETURN_ON_FALSE(size == sizeof(uint32_t), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for DATA_SEQ");
+        *(uint32_t *)arg = ESP_CAM_SENSOR_DATA_SEQ_NONE;
+        break;
+
     // Image Quality Controls
     case ESP_CAM_SENSOR_BRIGHTNESS:
         ESP_RETURN_ON_FALSE(size == sizeof(int32_t), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for BRIGHTNESS");
@@ -1305,7 +1319,14 @@ static esp_err_t imx708_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id
             ESP_LOGD(TAG, "set_para_value: Digital GAIN set to 0x%03X", *value);
         }
         break;
-        
+
+    case ESP_CAM_SENSOR_DATA_SEQ:
+        ESP_RETURN_ON_FALSE(size == sizeof(uint32_t), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for DATA_SEQ");
+        if (*(uint32_t *)arg != ESP_CAM_SENSOR_DATA_SEQ_NONE) {
+            ret = ESP_ERR_INVALID_ARG;
+        }
+        break;
+
     // Image Quality Controls
     case ESP_CAM_SENSOR_BRIGHTNESS:
         ESP_RETURN_ON_FALSE(size == sizeof(int), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for BRIGHTNESS");
@@ -1487,6 +1508,7 @@ static esp_err_t imx708_set_format(esp_cam_sensor_device_t *dev, const esp_cam_s
     ESP_CAM_SENSOR_NULL_POINTER_CHECK(TAG, dev);
 
     esp_err_t ret = ESP_OK;
+    struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
     
     // If format is NULL, use the default format based on Kconfig
     if (format == NULL) {
@@ -1610,25 +1632,31 @@ static esp_err_t imx708_set_format(esp_cam_sensor_device_t *dev, const esp_cam_s
 
         // Set better default exposure and gain for adequate brightness
         ESP_LOGD(TAG, "Setting balanced exposure and gain to avoid saturation");
-        
-        // Reduce exposure to prevent saturation in normal lighting (about 40ms)
-        uint32_t default_exposure = 0x1500;  // Reduzido de 0x2000 para evitar saturação
+
+        // Start with long exposure budget that keeps sensor streaming at 15fps
+        uint32_t default_exposure = 0x0CB2;  // ~3250 lines
         ret = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (default_exposure >> 8) & 0xFF);
         ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, default_exposure & 0xFF);
-        
-        // Reduce analog gain to prevent saturation (~6x instead of 8x)
-        uint16_t default_analog_gain = 0x0140;  // ~6x gain, mais conservativo
+
+        // Moderate analog gain to keep headroom for IPA/manual control
+        uint16_t default_analog_gain = 0x0140;  // ~6x gain
         ret = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN, (default_analog_gain >> 8) & 0xFF);
         ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, default_analog_gain & 0xFF);
-        
+
         // Keep moderate digital gain
-        uint16_t default_digital_gain = 0x0180;  // 1.5x digital gain (reduzido de 2x)
+        uint16_t default_digital_gain = 0x0180;  // 1.5x digital gain
         ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN, (default_digital_gain >> 8) & 0xFF);
         ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN + 1, default_digital_gain & 0xFF);
-        
+
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Default exposure/gain setting failed");
             return ret;
+        }
+
+        if (cam_imx708) {
+            cam_imx708->imx708_para.exposure_val = default_exposure;
+            cam_imx708->imx708_para.analog_gain = default_analog_gain;
+            cam_imx708->imx708_para.digital_gain = default_digital_gain;
         }
     }
 
