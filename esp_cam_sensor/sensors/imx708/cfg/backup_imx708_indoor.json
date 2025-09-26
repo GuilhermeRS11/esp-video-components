@@ -16,7 +16,7 @@
       "gamma": {
         "use_gamma_param": true,
         "luma_env": "ae.luma.avg",
-        "luma_min_step": 24.0,
+        "luma_min_step": 22.0,
         "table": [
           { "luma": 35.0, "gamma_param": 0.60 },
           { "luma": 55.0, "gamma_param": 0.68 },
@@ -39,15 +39,15 @@
       "contrast": [ { "gain": 1, "value": 130 } ]
     },
     "agc": {
-      "exposure": { "frame_delay": 8, "adjust_delay": 4 },
-      "gain": { "min_step": 0.01, "frame_delay": 3 },
+      "exposure": { "frame_delay": 6, "adjust_delay": 3 },
+      "gain": { "min_step": 0.02, "frame_delay": 1 },
       "anti_flicker": { "mode": "full", "ac_freq": 60 },
       "f_n0": 0.30,
       "f_m0": 0.38,
       "luma_adjust": {
-        "target_low": 58,
-        "target_high": 62,
-        "target": 60,
+        "target_low": 55,
+        "target_high": 58,
+        "target": 56,
         "low_threshold": 20,
         "low_regions": 4,
         "high_threshold": 210,
@@ -61,8 +61,8 @@
         ]
       },
       "mode": "low_light_priority",
-      "high_light_priority": { "low_threshold": 130, "high_threshold": 200, "weight_offset": 4, "luma_offset": -6 },
-      "low_light_priority": { "low_threshold": 48, "high_threshold": 70, "weight_offset": 6, "luma_offset": 3 },
+      "high_light_priority": { "low_threshold": 100, "high_threshold": 170, "weight_offset": 8, "luma_offset": -12 },
+      "low_light_priority": { "low_threshold": 48, "high_threshold": 66, "weight_offset": 4, "luma_offset": 2 },
       "light_threshold_priority": [
         { "luma_threshold": 25,  "weight_offset": 1 },
         { "luma_threshold": 60,  "weight_offset": 2 },
@@ -86,21 +86,21 @@
     },
     "awb": {
       "model": 0,
-      "min_counted": 300,
-      "min_red_gain_step": 0.02,
-      "min_blue_gain_step": 0.02,
+      "min_counted": 1300,
+      "min_red_gain_step": 0.03,
+      "min_blue_gain_step": 0.03,
       "range": {
-        "green": { "max": 205, "min": 160 },
-        "rg": { "max": 1.20, "min": 0.45 },
-        "bg": { "max": 1.20, "min": 0.45 }
+        "green": { "max": 215, "min": 170 },
+        "rg": { "max": 0.94, "min": 0.56 },
+        "bg": { "max": 0.84, "min": 0.52 }
       },
       "green_luma_env": "ae.luma.avg",
-      "green_luma_init": 170,
-      "green_luma_step_ratio": 0.12,
+      "green_luma_init": 188,
+      "green_luma_step_ratio": 0.14,
       "bayes": true,
-      "convergence_tolerance": 0.04,
-      "speed": 0.18,
-      "temporal_stability": 50,
+      "convergence_tolerance": 0.03,
+      "speed": 0.08,
+      "temporal_stability": 70,
       "white_points": [
       { "color_temp": 2856, "r": 1.48, "b": 1.88 },
       { "color_temp": 3200, "r": 1.32, "b": 1.72 },
@@ -108,15 +108,15 @@
       { "color_temp": 5000, "r": 0.99, "b": 1.33 },
       { "color_temp": 6500, "r": 0.89, "b": 1.17 }
       ],
-      "target": { "color_temp": 5500, "r": 0.96, "b": 1.24 }
+      "target": { "color_temp": 6200, "r": 0.90, "b": 1.16 }
     },
     "acc": {
-      "saturation": [ { "color_temp": 0, "value": 120 } ],
+      "saturation": [ { "color_temp": 0, "value": 130 } ],
       "ccm": {
         "low_luma": {
           "luma_env": "ae.luma.avg",
-          "threshold": 60,
-          "matrix": [ 1.02, -0.05, 0.03, -0.04, 1.02, -0.04, 0.01, -0.16, 1.15 ]
+          "threshold": 30,
+          "matrix": [ 1.01, -0.03, 0.02, -0.02, 1.05, -0.03, 0.00, -0.12, 1.12 ]
         },
         "table": [
           { "color_temp": 2856, "matrix": [ 1.36, -0.26, -0.08, -0.17, 1.30, -0.13, 0.00, -0.54, 1.55 ] },
@@ -147,3 +147,4 @@
     }
   }
 }
+

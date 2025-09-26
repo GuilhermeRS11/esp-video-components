@@ -69,7 +69,9 @@ static esp_err_t dw9714_read(esp_sccb_io_handle_t sccb_handle, uint16_t *read_bu
 
 static esp_err_t dw9714_write(esp_sccb_io_handle_t sccb_handle, uint16_t data)
 {
-    return esp_sccb_transmit_v16(sccb_handle, data);
+    esp_err_t ret = esp_sccb_transmit_v16(sccb_handle, data);
+    ESP_LOGD(TAG, "I2C write: 0x%04X -> ret=%d", data, (int)ret);
+    return ret;
 }
 
 /* write a array of vals */
@@ -90,20 +92,24 @@ static esp_err_t dw9714_set_pos_code(esp_cam_motor_device_t *dev, int pos)
 {
     esp_err_t ret = ESP_FAIL;
     dw9714_data_type_t w_data = {0};
+    int req = pos;
     if (pos > DW9714_MAX_FOCUS_POS) {
         pos = DW9714_MAX_FOCUS_POS;
     } else if (pos < DW9714_MIN_FOCUS_POS) {
         pos = DW9714_MIN_FOCUS_POS;
     }
 
+    ESP_LOGI(TAG, "Set focus: req=%d clamp=%d mode=%d", req, pos, (int)dev->cur_format->mode);
     switch (dev->cur_format->mode) {
     case ESP_CAM_MOTOR_DLC_MODE:
     case ESP_CAM_MOTOR_DIRECT_MODE:
         w_data.d = pos;
+        ESP_LOGD(TAG, "Write code (DLC/DIRECT): 0x%04X", w_data.val);
         ret = dw9714_write(dev->sccb_handle, w_data.val);
         break;
     case ESP_CAM_MOTOR_LSC_MODE:
         w_data.val = LSC_SET_CODE(pos);
+        ESP_LOGD(TAG, "Write code (LSC): 0x%04X", w_data.val);
         ret = dw9714_write(dev->sccb_handle, w_data.val);
         break;
     default:
@@ -114,6 +120,9 @@ static esp_err_t dw9714_set_pos_code(esp_cam_motor_device_t *dev, int pos)
         // This is not accurate, because moving to the designated position usually takes some times.
         dev->current_position = pos;
         dev->moving_start_time = esp_timer_get_time();
+        ESP_LOGD(TAG, "Focus set OK, current_position=%d", dev->current_position);
+    } else {
+        ESP_LOGE(TAG, "Focus set failed (ret=%d)", (int)ret);
     }
     return ret;
 }
@@ -185,7 +194,7 @@ static esp_err_t dw9714_set_para_value(esp_cam_motor_device_t *dev, uint32_t id,
     case ESP_CAM_MOTOR_POSITION_CODE: {
         ESP_RETURN_ON_FALSE(arg && size >= sizeof(int), ESP_ERR_INVALID_ARG, TAG, "Para size err");
         int *value = (int *)arg;
-
+        ESP_LOGI(TAG, "set_para POSITION_CODE=%d", *value);
         ret = dw9714_set_pos_code(dev, *value);
         break;
     }
@@ -219,6 +228,11 @@ static esp_err_t dw9714_set_format(esp_cam_motor_device_t *dev, const esp_cam_mo
     if (format == NULL) {
         format = &dw9714_format_info[CONFIG_DW9714_FORMAT_INDEX_DEFAULT];
     }
+    ESP_LOGI(TAG, "Motor fmt: %s mode=%d codes_per_step=%u period_us=%u init_pos=%d",
+             format->name ? format->name : "(null)", (int)format->mode,
+             (unsigned)format->step_period.codes_per_step,
+             (unsigned)format->step_period.period_in_us,
+             (int)format->init_position);
 
     ret = dw9714_write_array(dev->sccb_handle, (dw9714_data_type_t *)format->regs, format->regs_size);
 
@@ -308,9 +322,11 @@ static esp_err_t dw9714_priv_ioctl(esp_cam_motor_device_t *dev, uint32_t cmd, vo
 
     switch (cmd) {
     case ESP_CAM_MOTOR_IOC_HW_POWER_ON:
+        ESP_LOGI(TAG, "IOCTL: HW_POWER_ON %d", *(int *)arg);
         ret = dw9714_hw_power_on(dev, *(int *)arg);
         break;
     case ESP_CAM_MOTOR_IOC_SW_STANDBY:
+        ESP_LOGI(TAG, "IOCTL: SW_STANDBY %d", *(int *)arg);
         ret = dw9714_soft_standby(dev, *(int *)arg);
         break;
     default:

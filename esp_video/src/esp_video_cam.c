@@ -138,11 +138,11 @@ static const struct control_map s_motor_control_map_table[] = {
  */
 static const struct control_map *get_v4l2_ext_control_map(uint32_t v4l2_id, bool *ioctl, cam_dev_type_t *type)
 {
-    ESP_LOGI("esp_video_cam", "Looking for V4L2 ID: 0x%08lx", v4l2_id);
+    ESP_LOGD("esp_video_cam", "Looking for V4L2 ID: 0x%08lx", v4l2_id);
     
     for (int i = 0; i < ARRAY_SIZE(s_sensor_control_map_table); i++) {
         if (s_sensor_control_map_table[i].v4l2_id == v4l2_id) {
-            ESP_LOGI("esp_video_cam", "Found mapping: V4L2 0x%08lx -> ESP 0x%08lx", 
+            ESP_LOGD("esp_video_cam", "Found mapping: V4L2 0x%08lx -> ESP 0x%08lx", 
                      v4l2_id, s_sensor_control_map_table[i].esp_cam_priv_id);
             *ioctl = false;
             *type = CAM_DEV_SENSOR;
@@ -311,14 +311,34 @@ esp_err_t esp_video_cam_set_ext_ctrls(esp_video_cam_t *cam, const struct v4l2_ex
             int32_t value_buf = ctrl->value;
 
             switch (qdesc.type) {
-            case ESP_CAM_SENSOR_PARAM_TYPE_NUMBER:
-                if ((value_buf > qdesc.number.maximum) || (value_buf < qdesc.number.minimum) ||
-                        (value_buf % qdesc.number.step)) {
-                    ESP_LOGE(TAG, "number: ctrl id=%" PRIx32 " value=%" PRIi32 " is out of range(max=%" PRIi32 ", min=%" PRIi32 ", step=%"PRIu32")",
-                             ctrl->id, value_buf, (int32_t)qdesc.number.maximum, (int32_t)qdesc.number.minimum, (uint32_t)qdesc.number.step);
-                    return ESP_ERR_INVALID_ARG;
+            case ESP_CAM_SENSOR_PARAM_TYPE_NUMBER: {
+                int32_t minimum = qdesc.number.minimum;
+                int32_t maximum = qdesc.number.maximum;
+                uint32_t step = qdesc.number.step ? qdesc.number.step : 1;
+
+                // Clamp to [min,max]
+                if (value_buf < minimum) value_buf = minimum;
+                if (value_buf > maximum) value_buf = maximum;
+
+                // Round to nearest multiple of step
+                if (step > 1) {
+                    int64_t k = ((int64_t)value_buf + (int64_t)step / 2) / (int64_t)step;
+                    int32_t rounded = (int32_t)(k * (int64_t)step);
+                    if (rounded < minimum) {
+                        rounded = (int32_t)(((int64_t)minimum + (int64_t)step - 1) / (int64_t)step) * (int32_t)step;
+                    }
+                    if (rounded > maximum) {
+                        rounded = (int32_t)(((int64_t)maximum) / (int64_t)step) * (int32_t)step;
+                    }
+                    if (rounded != value_buf) {
+                        ESP_LOGD(TAG, "number: ctrl id=%" PRIx32 " rounded %" PRIi32 " -> %" PRIi32 " (min=%" PRIi32 ", max=%" PRIi32 ", step=%" PRIu32 ")",
+                                 ctrl->id, value_buf, rounded, minimum, maximum, step);
+                    }
+                    value_buf = rounded;
+                    ctrl->value = value_buf; // reflect rounded value back
                 }
                 break;
+            }
             case ESP_CAM_SENSOR_PARAM_TYPE_ENUMERATION: {
                 if (value_buf < 0 || value_buf >= qdesc.enumeration.count) {
                     ESP_LOGE(TAG, "enum: ctrl id=%" PRIx32 " value=%" PRIu32 " is out of range(from 0 to %" PRIu32 ")",
@@ -564,17 +584,33 @@ esp_err_t esp_video_cam_query_menu(esp_video_cam_t *cam, struct v4l2_querymenu *
         return ret;
     }
 
-    if (qdesc.type != ESP_CAM_SENSOR_PARAM_TYPE_ENUMERATION) {
+    if (qdesc.type == ESP_CAM_SENSOR_PARAM_TYPE_ENUMERATION) {
+        if (qmenu->index >= qdesc.enumeration.count) {
+            ESP_LOGE(TAG, "ctrl id=%" PRIx32 " is out of range(max=%" PRIx32 ")", qmenu->id, qdesc.enumeration.count - 1);
+            return ESP_ERR_INVALID_ARG;
+        }
+        qmenu->value = qdesc.enumeration.elements[qmenu->index];
+        return ESP_OK;
+    } else if (qdesc.type == ESP_CAM_SENSOR_PARAM_TYPE_NUMBER) {
+        uint32_t step = qdesc.number.step ? qdesc.number.step : 1;
+        int32_t minimum = qdesc.number.minimum;
+        int32_t maximum = qdesc.number.maximum;
+
+        if (maximum < minimum) {
+            ESP_LOGE(TAG, "ctrl id=%" PRIx32 " invalid range(min=%" PRIi32 ", max=%" PRIi32 ")", qmenu->id, minimum, maximum);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        uint32_t count = (uint32_t)((maximum - minimum) / (int32_t)step) + 1U;
+        if (qmenu->index >= count) {
+            ESP_LOGE(TAG, "ctrl id=%" PRIx32 " is out of range(max index=%" PRIu32 ")", qmenu->id, count - 1);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        qmenu->value = (uint32_t)(minimum + (int32_t)(qmenu->index * step));
+        return ESP_OK;
+    } else {
         ESP_LOGE(TAG, "ctrl id=%" PRIx32 " is not menu type", qmenu->id);
         return ESP_ERR_INVALID_ARG;
     }
-
-    if (qmenu->index >= qdesc.enumeration.count) {
-        ESP_LOGE(TAG, "ctrl id=%" PRIx32 " is out of range(max=" PRIx32 ")", qdesc.enumeration.count - 1);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    qmenu->value = qdesc.enumeration.elements[qmenu->index];
-
-    return ESP_OK;
 }

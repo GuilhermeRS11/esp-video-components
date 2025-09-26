@@ -1,0 +1,43 @@
+menuconfig CAM_MOTOR_DW9807
+    bool "DW9807 / DW9817"
+    default n
+    select CAMERA_MOTOR_DEVICE_USED
+    help
+        Enable support for the DW9807/DW9817 Voice Coil Motor (VCM) autofocus actuator.
+
+if CAM_MOTOR_DW9807
+    config CAM_MOTOR_DW9807_AUTO_DETECT
+        bool "Auto detect DW9807"
+        default y
+        help
+            When enabled, the DW9807 motor will be automatically detected and
+            initialized during system startup without requiring manual detection
+            calls in your application.
+
+    choice CAM_MOTOR_DW9807_DEFAULT_FMT
+        prompt "Default format select"
+        default CAM_MOTOR_DW9807_DIRECT
+        help
+            Select the default control format used when the motor is detected.
+
+        config CAM_MOTOR_DW9807_DIRECT
+            bool "DIRECT mode"
+            help
+                Directly writes the target position to the device registers.
+    endchoice # CAM_MOTOR_DW9807_DEFAULT_FMT
+
+    config DW9807_FORMAT_INDEX_DEFAULT
+        int
+        default 0
+        help
+            Internal format index for the selected default motor configuration.
+
+    config DW9807_DEFAULT_POSITION
+        int "Default focus position"
+        range 0 1023
+        default 0
+        help
+            Initial focus position to set after the motor is initialized.
+
+endif
+

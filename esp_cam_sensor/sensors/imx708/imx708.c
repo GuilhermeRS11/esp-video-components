@@ -517,6 +517,7 @@ static esp_err_t imx708_set_exposure_us(esp_cam_sensor_device_t *dev, uint32_t e
     const esp_cam_sensor_format_t *format = dev->cur_format;
     uint32_t fps = format->fps;
     uint32_t vts = format->isp_info->isp_v1_info.vts;
+    // Enforce a practical cap in microseconds to favor gain over excessive shutter
     
     // Calculate exposure in lines: exposure_us * fps * vts / 1,000,000
     uint64_t exposure_lines = ((uint64_t)exposure_us * fps * vts) / 1000000ULL;
@@ -982,7 +983,7 @@ static esp_err_t imx708_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_se
             uint32_t vts = dev->cur_format->isp_info->isp_v1_info.vts;
             qdesc->number.minimum = (IMX708_EXPOSURE_MIN * 1000000UL) / (fps * vts);
             qdesc->number.maximum = ((vts - IMX708_EXPOSURE_MAX_OFFSET) * 1000000UL) / (fps * vts);
-            // Use step of 65 to match V4L2 validation requirements
+                        // Use step of 65 to match V4L2 validation requirements
             qdesc->number.step = 65;
             // Adjust default to be a multiple of 65
             uint32_t calculated_default = (IMX708_EXPOSURE_DEFAULT * 1000000UL) / (fps * vts);

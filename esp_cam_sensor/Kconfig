@@ -103,6 +103,7 @@ menu "Espressif Camera Sensors Configurations"
 
     menu "Camera Motor Control Configuration"
         rsource "motors/dw9714/Kconfig.dw9714"
+        rsource "motors/dw9807/Kconfig.dw9807"
 
         config CAMERA_MOTOR_DEVICE_USED
             bool

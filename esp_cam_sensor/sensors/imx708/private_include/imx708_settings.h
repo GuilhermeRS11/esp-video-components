@@ -277,12 +277,13 @@ static const imx708_reginfo_t imx708_800x640_regs[] = {
     {0x0343, 0x00},
     {0x0340, 0x0C},  // FRM_LENGTH_LINES - tuned for 15fps with long exposure support: 3296
     {0x0341, 0xE0},
-    {0x0344, 0x05},  // X_ADDR_START - Centered crop start: 1504
-    {0x0345, 0xE0},
+    // Move ROI 4x to the right from current (+64 pre-bin ≈ +32 px at 800p)
+    {0x0344, 0x07},  // X_ADDR_START -> 0x0730 (1840)
+    {0x0345, 0x30},
     {0x0346, 0x02},  // Y_ADDR_START - Centered crop start: 656  
     {0x0347, 0x90},
-    {0x0348, 0x0C},  // X_ADDR_END - Centered crop end: 3103
-    {0x0349, 0x1F},
+    {0x0348, 0x0D},  // X_ADDR_END  -> 0x0D6F (3439) keeps width 1600
+    {0x0349, 0x6F},
     {0x034A, 0x07},  // Y_ADDR_END - Centered crop end: 1935
     {0x034B, 0x8F},
     {0x0220, 0x62},

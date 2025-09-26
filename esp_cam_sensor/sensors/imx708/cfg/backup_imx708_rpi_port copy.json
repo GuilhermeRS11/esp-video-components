@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "IMX708": {
+    "adn": {
+      "bf": [
+        {
+          "gain": 1,
+          "param": {
+            "level": 5,
+            "matrix": [ 1, 2, 1, 2, 4, 2, 1, 2, 1 ]
+          }
+        }
+      ]
+    },
+    "aen": {
+      "gamma": {
+        "use_gamma_param": true,
+        "luma_env": "ae.luma.avg",
+        "luma_min_step": 14.0,
+        "table": [
+          { "luma": 35.0, "gamma_param": 0.60 },
+          { "luma": 55.0, "gamma_param": 0.68 },
+          { "luma": 75.0, "gamma_param": 0.76 }
+        ]
+      },
+      "sharpen": [
+        {
+          "gain": 1,
+          "param": {
+            "h_thresh": 60,
+            "l_thresh": 12,
+            "h_coeff": 0.40,
+            "m_coeff": 0.60,
+            "matrix": [ 1, 2, 1, 2, 2, 2, 1, 2, 1 ]
+          }
+        }
+      ],
+      "contrast": [ { "gain": 1, "value": 130 } ]
+    },
+    "ian": {
+      "luma": {
+        "ae": {
+          "weight": [
+            1, 1, 1, 1, 1,
+            1, 2, 2, 2, 1,
+            1, 2, 4, 2, 1,
+            1, 2, 2, 2, 1,
+            1, 1, 1, 1, 1
+          ]
+        }
+      }
+    },
+    "awb": {
+      "model": 0,
+      "min_counted": 1300,
+      "min_red_gain_step": 0.03,
+      "min_blue_gain_step": 0.03,
+      "range": {
+        "green": { "max": 215, "min": 170 },
+        "rg": { "max": 0.94, "min": 0.56 },
+        "bg": { "max": 0.84, "min": 0.52 }
+      },
+      "green_luma_env": "ae.luma.avg",
+      "green_luma_init": 188,
+      "green_luma_step_ratio": 0.14,
+      "bayes": true,
+      "convergence_tolerance": 0.02,
+      "speed": 0.14,
+      "temporal_stability": 30,
+      "white_points": [
+        { "color_temp": 2856, "r": 1.48, "b": 1.88 },
+        { "color_temp": 3200, "r": 1.32, "b": 1.72 },
+        { "color_temp": 4000, "r": 1.14, "b": 1.50 },
+        { "color_temp": 5000, "r": 0.99, "b": 1.33 },
+        { "color_temp": 6500, "r": 0.89, "b": 1.17 }
+      ],
+      "target": { "color_temp": 6200, "r": 0.90, "b": 1.16 }
+    },
+    "acc": {
+      "saturation": [ { "color_temp": 0, "value": 130 } ],
+      "ccm": {
+        "low_luma": {
+          "luma_env": "ae.luma.avg",
+          "threshold": 30,
+          "matrix": [ 1.01, -0.03, 0.02, -0.02, 1.05, -0.03, 0.00, -0.12, 1.12 ]
+        },
+        "table": [
+          { "color_temp": 2856, "matrix": [ 1.36, -0.26, -0.08, -0.17, 1.30, -0.13, 0.00, -0.54, 1.55 ] },
+          { "color_temp": 3200, "matrix": [ 1.28, -0.22, -0.06, -0.14, 1.27, -0.13, 0.00, -0.49, 1.50 ] },
+          { "color_temp": 4000, "matrix": [ 1.16, -0.16, -0.01, -0.11, 1.21, -0.11, 0.00, -0.39, 1.39 ] },
+          { "color_temp": 5000, "matrix": [ 1.04, -0.08, 0.04, -0.07, 1.15, -0.08, 0.00, -0.29, 1.27 ] },
+          { "color_temp": 6500, "matrix": [ 0.99, -0.02, 0.03, -0.04, 1.08, -0.05, 0.00, -0.16, 1.16 ] }
+        ]
+      }
+    },
+    "agc": {
+      "exposure": { "frame_delay": 2, "adjust_delay": 0 },
+      "gain": { "min_step": 0.025, "frame_delay": 3 },
+      "anti_flicker": { "mode": "part", "ac_freq": 50 },
+      "f_n0": 0.30,
+      "f_m0": 0.38,
+      "luma_adjust": {
+        "target_low": 56,
+        "target_high": 64,
+        "target": 60,
+        "low_threshold": 20,
+        "low_regions": 4,
+        "high_threshold": 210,
+        "high_regions": 3,
+        "weight": [
+          1, 1, 1, 1, 1,
+          1, 2, 3, 2, 1,
+          1, 3, 5, 3, 1,
+          1, 2, 3, 2, 1,
+          1, 1, 1, 1, 1
+        ]
+      },
+      "mode": "high_light_priority",
+      "high_light_priority": { "low_threshold": 115, "high_threshold": 190, "weight_offset": 6, "luma_offset": -6 },
+      "low_light_priority": { "low_threshold": 48, "high_threshold": 66, "weight_offset": 4, "luma_offset": 2 },
+      "light_threshold_priority": [
+        { "luma_threshold": 25,  "weight_offset": 1 },
+        { "luma_threshold": 60,  "weight_offset": 2 },
+        { "luma_threshold": 95,  "weight_offset": 3 },
+        { "luma_threshold": 145, "weight_offset": 4 },
+        { "luma_threshold": 220, "weight_offset": 5 }
+      ]
+    },
+    "af": {
+      "model": 0,
+      "windows": [
+        { "left": 160, "top": 140, "width": 480, "height": 360 },
+        { "left": 260, "top": 180, "width": 280, "height": 220 },
+        { "left": 320, "top": 220, "width": 160, "height": 160 }
+      ],
+      "edge_thresh": 32,
+      "definition_high_threshold_ratio": 1.15,
+      "definition_low_threshold_ratio": 0.85,
+      "luminance_high_threshold_ratio": 1.10,
+      "luminance_low_threshold_ratio": 0.90,
+      "l1_scan_points_num": 10,
+      "l2_scan_points_num": 6,
+      "max_pos": 950,
+      "max_change_time": 1800000
+    }
+  }
+}
+

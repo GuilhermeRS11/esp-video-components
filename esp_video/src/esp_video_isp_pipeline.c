@@ -433,6 +433,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
     struct v4l2_ext_controls controls;
     struct v4l2_ext_control control[1];
 
+
     if (metadata->flags & IPA_METADATA_FLAGS_GN) {
         int ret;
         int32_t base_gain;
@@ -552,8 +553,25 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
             (metadata->flags & IPA_METADATA_FLAGS_GN) &&
             isp->sensor_attr.group) {
         esp_cam_sensor_gh_exp_gain_t group;
-
-        group.exposure_us = metadata->exposure / 100;
+        // Sanitize exposure against device limits (V4L2_CID_EXPOSURE_ABSOLUTE is in 100us units)
+        uint32_t apply_us = metadata->exposure;
+        {
+            struct v4l2_query_ext_ctrl qexp = {0};
+            qexp.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+            if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qexp) == 0 && qexp.step > 0) {
+                int64_t min_us = (int64_t)qexp.minimum * 100LL;
+                int64_t max_us = (int64_t)qexp.maximum * 100LL;
+                int64_t step_us = (int64_t)qexp.step * 100LL;
+                int64_t au = (int64_t)apply_us;
+                // round to nearest step
+                au = (au + step_us / 2) / step_us;
+                au *= step_us;
+                if (au < min_us) au = min_us;
+                if (au > max_us) au = max_us;
+                apply_us = (uint32_t)au;
+            }
+        }
+        group.exposure_us = apply_us;
         group.gain_index = gain_index;
 
         controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
@@ -565,23 +583,39 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
         if (ioctl(isp->cam_fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
             ESP_LOGE(TAG, "failed to set group");
         } else {
-            isp->sensor.cur_exposure = metadata->exposure;
+            isp->sensor.cur_exposure = apply_us;
             isp->sensor.cur_gain = target_gain;
             isp->prev_gain_index = gain_index;
-        }
+                    }
     } else {
         if ((metadata->flags & IPA_METADATA_FLAGS_ET) &&
                 isp->sensor_attr.exposure) {
+            uint32_t apply_us = metadata->exposure;
+            {
+                struct v4l2_query_ext_ctrl qexp = {0};
+                qexp.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+                if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qexp) == 0 && qexp.step > 0) {
+                    int64_t min_us = (int64_t)qexp.minimum * 100LL;
+                    int64_t max_us = (int64_t)qexp.maximum * 100LL;
+                    int64_t step_us = (int64_t)qexp.step * 100LL;
+                    int64_t au = (int64_t)apply_us;
+                    au = (au + step_us / 2) / step_us;
+                    au *= step_us;
+                    if (au < min_us) au = min_us;
+                    if (au > max_us) au = max_us;
+                    apply_us = (uint32_t)au;
+                }
+            }
             controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
             controls.count      = 1;
             controls.controls   = control;
             control[0].id       = V4L2_CID_EXPOSURE_ABSOLUTE;
-            control[0].value    = (int32_t)metadata->exposure / 100;
+            control[0].value    = (int32_t)apply_us / 100;
             if (ioctl(isp->cam_fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
                 ESP_LOGE(TAG, "failed to set exposure time");
             } else {
-                isp->sensor.cur_exposure = metadata->exposure;
-            }
+                isp->sensor.cur_exposure = apply_us;
+                            }
         }
 
         if ((metadata->flags & IPA_METADATA_FLAGS_GN) &&
@@ -721,6 +755,8 @@ static void config_af(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
 #if CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR
 static void config_motor_position(esp_video_isp_t *isp, esp_ipa_metadata_t *metadata)
 {
+    // AF runs freely (no gating by AE stability)
+
     struct v4l2_ext_controls controls;
     struct v4l2_ext_control control[1];
 
@@ -918,6 +954,52 @@ static void isp_task(void *p)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "failed to process image algorithm");
             continue;
+        }
+        // Compact telemetry: log key metadata at a low rate for tuning
+        {
+            static uint32_t s_log_counter = 0;
+            if ((s_log_counter++ % 5) == 0) { // ~1 line per ~30 stats frames
+                char buf[192];
+                int n = 0;
+                n += snprintf(buf + n, sizeof(buf) - n, "[META]");
+                // Prefer values from metadata when flagged; otherwise fall back to current sensor state
+                // Prefer reporting the applied sensor exposure if available
+                if (isp->sensor.cur_exposure) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->sensor.cur_exposure);
+                } else if (isp->metadata.flags & IPA_METADATA_FLAGS_ET) {
+                    // metadata.exposure is in microseconds
+                    n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->metadata.exposure);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_GN) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " gain=%.2f", (double)isp->metadata.gain);
+                } else if (isp->sensor.cur_gain > 0.0f) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " gain=%.2f", (double)isp->sensor.cur_gain);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_RG) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " rG=%.3f", (double)isp->metadata.red_gain);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_BG) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " bG=%.3f", (double)isp->metadata.blue_gain);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_AETL) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " ae_tl=%u", (unsigned)isp->metadata.ae_target_level);
+                } else if (isp->sensor.cur_ae_target_level) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " ae_tl=%u", (unsigned)isp->sensor.cur_ae_target_level);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_CN) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " con=%u", (unsigned)isp->metadata.contrast);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_ST) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " sat=%u", (unsigned)isp->metadata.saturation);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_BR) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " br=%u", (unsigned)isp->metadata.brightness);
+                }
+                if (isp->metadata.flags & IPA_METADATA_FLAGS_FP) {
+                    n += snprintf(buf + n, sizeof(buf) - n, " focus=%u", (unsigned)isp->metadata.focus_pos);
+                }
+                ESP_LOGI(TAG, "%s", buf);
+            }
         }
 
         config_isp_and_camera(isp, &isp->metadata);

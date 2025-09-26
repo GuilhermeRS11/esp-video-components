@@ -592,13 +592,25 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
              (unsigned long)timeperframe->numerator,
              (unsigned long)video->frame_rate);
 
-    // Try to explicitly apply FPS via S_PARM (some drivers require it to stabilize timing)
+    // Force a nominal 15 fps output (driver may implement via frame skipping)
     struct v4l2_streamparm sparm_set = {0};
     sparm_set.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    sparm_set.parm.capture.timeperframe.numerator = timeperframe->numerator;
-    sparm_set.parm.capture.timeperframe.denominator = timeperframe->denominator;
+    sparm_set.parm.capture.capability |= V4L2_CAP_TIMEPERFRAME;
+    sparm_set.parm.capture.timeperframe.numerator = 1;
+    sparm_set.parm.capture.timeperframe.denominator = 15;
     if (ioctl(fd, VIDIOC_S_PARM, &sparm_set) != 0) {
-        ESP_LOGW(TAG, "video%d: VIDIOC_S_PARM failed (keeping current fps)", index);
+        ESP_LOGW(TAG, "video%d: VIDIOC_S_PARM(15fps) failed (keeping current fps)", index);
+    } else {
+        memset(&sparm, 0, sizeof(sparm));
+        sparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_G_PARM, &sparm) == 0) {
+            ESP_LOGI(TAG, "video%d: applied fps: %lu/%lu = %.2f", index,
+                     (unsigned long)sparm.parm.capture.timeperframe.denominator,
+                     (unsigned long)sparm.parm.capture.timeperframe.numerator,
+                     sparm.parm.capture.timeperframe.numerator ?
+                     (double)sparm.parm.capture.timeperframe.denominator /
+                     (double)sparm.parm.capture.timeperframe.numerator : 0.0);
+        }
     }
 
     // Force camera to output YUV422 planar for m2m compatibility
@@ -658,6 +670,8 @@ static esp_err_t init_web_cam_video(web_cam_video_t *video, const web_cam_video_
     video->pixel_format = format.fmt.pix.pixelformat;
     video->jpeg_quality = EXAMPLE_JPEG_ENC_QUALITY;
     video->buffer_count = req.count;
+
+    // Do not seed exposure/gain here; let IPA + JSON drive initial 3A to avoid early overshoot.
 
     ESP_LOGI(TAG, "[PIPELINE_DEBUG] Video%d: Detected format: %lux%lu " V4L2_FMT_STR " (buffer_size=%lu bytes)", 
              index, (unsigned long)video->width, (unsigned long)video->height, 
@@ -1103,7 +1117,7 @@ static void initialise_mdns(void)
                                      sizeof(serviceTxtData) / sizeof(serviceTxtData[0])));
 }
 
-void app_main(void)
+static void example_app_task(void *arg)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1159,6 +1173,15 @@ void app_main(void)
     ESP_ERROR_CHECK(start_cam_web_server(config, config_count));
 
     ESP_LOGI(TAG, "Camera web server starts");
+
+    vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+    // Run the example in a dedicated task with a larger stack to avoid main task overflow
+    const uint32_t stack_size = 12288; // bytes
+    xTaskCreate(example_app_task, "svs_example", stack_size, NULL, 5, NULL);
 }
 static esp_err_t restart_video_stream(web_cam_video_t *video)
 {

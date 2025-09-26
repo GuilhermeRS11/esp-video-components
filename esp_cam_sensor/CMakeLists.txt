@@ -110,6 +110,11 @@ if(CONFIG_CAM_MOTOR_DW9714)
     list(APPEND priv_include_dirs "motors/dw9714/private_include")
 endif()
 
+if(CONFIG_CAM_MOTOR_DW9807)
+    list(APPEND srcs "motors/dw9807/dw9807.c")
+    list(APPEND include_dirs "motors/dw9807/include")
+endif()
+
 if(CONFIG_CAMERA_IMX708)
   list(APPEND srcs "sensors/imx708/imx708.c")
   list(APPEND include_dirs "sensors/imx708/include")
@@ -186,6 +191,10 @@ endif()
 
 if(CONFIG_CAM_MOTOR_DW9714_AUTO_DETECT)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u dw9714_detect")
+endif()
+
+if(CONFIG_CAM_MOTOR_DW9807_AUTO_DETECT)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u dw9807_detect")
 endif()
 
 if(CONFIG_CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR)
