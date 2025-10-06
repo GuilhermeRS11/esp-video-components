@@ -435,116 +435,111 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
 
 
     if (metadata->flags & IPA_METADATA_FLAGS_GN) {
-        int ret;
-        int32_t base_gain;
-        int32_t gain_value;
-        uint32_t cur_index;
-        uint32_t left_index;
-        uint32_t right_index;
-        struct v4l2_querymenu qmenu;
-        struct v4l2_query_ext_ctrl qctrl;
-
+        // Prefer INTEGER control if available; fallback to MENU search
+        struct v4l2_query_ext_ctrl qctrl = {0};
         qctrl.id = V4L2_CID_GAIN;
-        ret = ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qctrl);
-        if (ret) {
-            ESP_LOGE(TAG, "failed to query gain");
-            return;
-        }
-
-        qmenu.id = V4L2_CID_GAIN;
-        qmenu.index = qctrl.minimum;
-        ret = ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu);
-        if (ret) {
-            ESP_LOGE(TAG, "failed to query gain min menu");
-            return;
-        }
-
-        gain_value = qmenu.value * metadata->gain;
-        base_gain = qmenu.value;
-        left_index = qctrl.minimum;
-        right_index = qctrl.maximum;
-        cur_index = (left_index + right_index) / 2;
-
-        int max_inter = qctrl.maximum - qctrl.minimum;
-        do {
-            if (max_inter-- <= 0) {
-                ESP_LOGE(TAG, "failed to search target gain");
-                break;
-            }
-
-            ESP_LOGD(TAG, "index:%"PRIu32", left:%"PRIu32", right:%"PRIu32"", cur_index, left_index, right_index);
+        if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qctrl) == 0 && qctrl.type == V4L2_CTRL_TYPE_INTEGER) {
+            // Direct integer scaling: value ~= target_gain * minimum
+            int64_t minv = qctrl.minimum;
+            int64_t maxv = qctrl.maximum;
+            int64_t step = qctrl.step > 0 ? qctrl.step : 1;
+            float tg = metadata->gain;
+            // clamp tg to [1.0, max/min]
+            float tg_max = (float)maxv / (float)minv;
+            if (tg < 1.0f) tg = 1.0f;
+            if (tg > tg_max) tg = tg_max;
+            int64_t raw = (int64_t)llroundf(tg * (float)minv);
+            // round to step
+            int64_t off = raw - minv;
+            off = ((off + step / 2) / step) * step;
+            raw = minv + off;
+            if (raw < minv) raw = minv;
+            if (raw > maxv) raw = maxv;
+            gain_index = (int32_t)raw;
+            target_gain = (float)gain_index / (float)minv;
+        } else {
+            // Fallback: integer menu binary search (previous behavior)
+            int ret;
+            int32_t base_gain;
+            int32_t gain_value;
+            uint32_t cur_index;
+            uint32_t left_index;
+            uint32_t right_index;
+            struct v4l2_querymenu qmenu;
 
             qmenu.id = V4L2_CID_GAIN;
-            qmenu.index = cur_index;
-            if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) {
+            // Query base (min) menu value
+            struct v4l2_query_ext_ctrl qc2 = { .id = V4L2_CID_GAIN };
+            if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qc2) != 0) {
+                ESP_LOGE(TAG, "failed to query gain ctrl");
+                return;
+            }
+            qmenu.index = qc2.minimum;
+            ret = ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu);
+            if (ret) {
                 ESP_LOGE(TAG, "failed to query gain min menu");
                 return;
             }
 
-            if (gain_value > qmenu.value) {
-                left_index = cur_index;
-                cur_index = (cur_index + right_index) / 2;
-            } else if (gain_value < qmenu.value) {
-                right_index = cur_index;
-                cur_index = (cur_index + left_index) / 2;
-            } else {
-                gain_index = cur_index;
-                target_gain = (float)qmenu.value / base_gain;
-                break;
-            }
+            gain_value = qmenu.value * metadata->gain;
+            base_gain = qmenu.value;
+            left_index = qc2.minimum;
+            right_index = qc2.maximum;
+            cur_index = (left_index + right_index) / 2;
 
-            int index_diff = right_index - left_index;
-            if (index_diff == 1) {
-                uint32_t left_gain;
-                uint32_t right_gain;
-                uint32_t left_len;
-                uint32_t right_len;
+            int max_inter = qc2.maximum - qc2.minimum;
+            do {
+                if (max_inter-- <= 0) {
+                    ESP_LOGE(TAG, "failed to search target gain");
+                    break;
+                }
 
-                qmenu.id = V4L2_CID_GAIN;
-                qmenu.index = left_index;
+                qmenu.index = cur_index;
                 if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) {
-                    ESP_LOGE(TAG, "failed to query gain min menu");
+                    ESP_LOGE(TAG, "failed to query gain menu");
                     return;
                 }
-                left_gain = qmenu.value;
 
-                qmenu.id = V4L2_CID_GAIN;
-                qmenu.index = right_index;
-                if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) {
-                    ESP_LOGE(TAG, "failed to query gain min menu");
-                    return;
-                }
-                right_gain = qmenu.value;
-
-                left_len = gain_value - left_gain;
-                right_len = right_gain - gain_value;
-                if (left_len > right_len) {
-                    gain_index = right_index;
-                    target_gain = (float)right_gain / base_gain;
+                if (gain_value > qmenu.value) {
+                    left_index = cur_index;
+                    cur_index = (cur_index + right_index) / 2;
+                } else if (gain_value < qmenu.value) {
+                    right_index = cur_index;
+                    cur_index = (cur_index + left_index) / 2;
                 } else {
-                    gain_index = left_index;
-                    target_gain = (float)left_gain / base_gain;
+                    gain_index = cur_index;
+                    target_gain = (float)qmenu.value / base_gain;
+                    break;
                 }
 
-                break;
-            } else if (index_diff == 0) {
-                qmenu.id = V4L2_CID_GAIN;
-                qmenu.index = left_index;
-                if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) {
-                    ESP_LOGE(TAG, "failed to query gain min menu");
-                    return;
+                int index_diff = right_index - left_index;
+                if (index_diff <= 1) {
+                    // choose closer bound
+                    uint32_t left_gain, right_gain;
+                    qmenu.index = left_index;
+                    if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) return;
+                    left_gain = qmenu.value;
+                    qmenu.index = right_index;
+                    if (ioctl(isp->cam_fd, VIDIOC_QUERYMENU, &qmenu)) return;
+                    right_gain = qmenu.value;
+                    if ((gain_value - (int32_t)left_gain) > ((int32_t)right_gain - gain_value)) {
+                        gain_index = right_index;
+                        target_gain = (float)right_gain / base_gain;
+                    } else {
+                        gain_index = left_index;
+                        target_gain = (float)left_gain / base_gain;
+                    }
+                    break;
                 }
+            } while (1);
 
-                gain_index = left_index;
-                target_gain = (float)qmenu.value / base_gain;
-                break;
+            if (gain_index < 0) {
+                ESP_LOGE(TAG, "failed to find gain=%0.4f", metadata->gain);
+                return;
             }
-        } while (1);
+        }
 
-        if (gain_index < 0) {
-            ESP_LOGE(TAG, "failed to find gain=%0.4f", metadata->gain);
-            return;
-        } else if (isp->prev_gain_index == gain_index) {
+        if (isp->prev_gain_index == gain_index) {
             metadata->flags &= ~IPA_METADATA_FLAGS_GN;
         }
     }
@@ -962,19 +957,53 @@ static void isp_task(void *p)
                 char buf[192];
                 int n = 0;
                 n += snprintf(buf + n, sizeof(buf) - n, "[META]");
-                // Prefer values from metadata when flagged; otherwise fall back to current sensor state
-                // Prefer reporting the applied sensor exposure if available
-                if (isp->sensor.cur_exposure) {
-                    n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->sensor.cur_exposure);
-                } else if (isp->metadata.flags & IPA_METADATA_FLAGS_ET) {
-                    // metadata.exposure is in microseconds
-                    n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->metadata.exposure);
+                // Report applied exposure from the camera driver when possible
+                {
+                    struct v4l2_ext_controls c = {0};
+                    struct v4l2_ext_control  ctrl[1] = {0};
+                    c.ctrl_class = V4L2_CID_CAMERA_CLASS;
+                    c.count = 1;
+                    c.controls = ctrl;
+                    ctrl[0].id = V4L2_CID_EXPOSURE_ABSOLUTE; // units: 100us
+                    if (ioctl(isp->cam_fd, VIDIOC_G_EXT_CTRLS, &c) == 0) {
+                        unsigned applied_us = (unsigned)ctrl[0].value * 100U;
+                        n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", applied_us);
+                    } else if (isp->sensor.cur_exposure) {
+                        n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->sensor.cur_exposure);
+                    } else if (isp->metadata.flags & IPA_METADATA_FLAGS_ET) {
+                        n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->metadata.exposure);
+                    }
                 }
                 if (isp->metadata.flags & IPA_METADATA_FLAGS_GN) {
                     n += snprintf(buf + n, sizeof(buf) - n, " gain=%.2f", (double)isp->metadata.gain);
                 } else if (isp->sensor.cur_gain > 0.0f) {
                     n += snprintf(buf + n, sizeof(buf) - n, " gain=%.2f", (double)isp->sensor.cur_gain);
                 }
+                // Try to fetch current analogue/digital gains for detailed logging
+                {
+                    struct v4l2_ext_controls c = {0};
+                    struct v4l2_ext_control  ctrl[1] = {0};
+                    // Analogue gain (raw code)
+                    c.ctrl_class = V4L2_CID_CAMERA_CLASS;
+                    c.count = 1;
+                    c.controls = ctrl;
+                    ctrl[0].id = V4L2_CID_ANALOGUE_GAIN;
+                    if (ioctl(isp->cam_fd, VIDIOC_G_EXT_CTRLS, &c) == 0) {
+                        n += snprintf(buf + n, sizeof(buf) - n, " ag=%ld", (long)ctrl[0].value);
+                    }
+                    // Digital gain (code/256)
+                    memset(&c, 0, sizeof(c));
+                    memset(ctrl, 0, sizeof(ctrl));
+                    c.ctrl_class = V4L2_CID_CAMERA_CLASS;
+                    c.count = 1;
+                    c.controls = ctrl;
+                    ctrl[0].id = V4L2_CID_DIGITAL_GAIN;
+                    if (ioctl(isp->cam_fd, VIDIOC_G_EXT_CTRLS, &c) == 0) {
+                        float dg = (ctrl[0].value > 0) ? (ctrl[0].value / 256.0f) : 0.0f;
+                        n += snprintf(buf + n, sizeof(buf) - n, " dg=%.2f", (double)dg);
+                    }
+                }
+
                 if (isp->metadata.flags & IPA_METADATA_FLAGS_RG) {
                     n += snprintf(buf + n, sizeof(buf) - n, " rG=%.3f", (double)isp->metadata.red_gain);
                 }
@@ -1085,7 +1114,24 @@ static esp_err_t init_cam_dev(const esp_video_isp_config_t *config, esp_video_is
         controls.count      = 1;
         controls.controls   = control;
         control[0].id       = V4L2_CID_EXPOSURE_ABSOLUTE;
-        control[0].value    = qctrl.default_value;
+        // Prefer a safer initial exposure (target ~4ms) to avoid underexposed start
+        int32_t init_val = qctrl.default_value; // units: 100us
+        int32_t step = (qctrl.step > 0) ? (int32_t)qctrl.step : 1;
+        int32_t minv = (int32_t)qctrl.minimum;
+        int32_t maxv = (int32_t)qctrl.maximum;
+        // Aim ~4.0ms (40 units) if default is too low
+        const int32_t prefer = 40; // 4.0ms
+        if (init_val < prefer) {
+            init_val = prefer;
+        }
+        // Round to step and clamp
+        if (step > 1) {
+            int32_t k = (init_val + step/2) / step;
+            init_val = k * step;
+        }
+        if (init_val < minv) init_val = ((minv + step - 1) / step) * step;
+        if (init_val > maxv) init_val = (maxv / step) * step;
+        control[0].value    = init_val;
         ret = ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls);
         ESP_GOTO_ON_FALSE(ret == 0, ESP_ERR_NOT_SUPPORTED, fail_0, TAG, "failed to set exposure time");
 

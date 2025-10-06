@@ -18,10 +18,6 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "simple_shell.h"
-#include "camera_shell.h"
-#if CONFIG_CAMERA_IMX708
-#include "imx708_hardware_shell.h"
-#endif
 
 static const char* TAG = "simple_shell";
 
@@ -114,13 +110,13 @@ static int info_cmd(int argc, char **argv)
     printf("Minimum free heap: %lu bytes\n", esp_get_minimum_free_heap_size());
     
     printf("\nWorking Camera Commands:\n");
-    printf("  cam_red_balance      - Red color balance (V4L2)\n");
-    printf("  cam_blue_balance     - Blue color balance (V4L2)\n");
-    printf("  cam_exposure         - Exposure control (V4L2)\n");
-    printf("  cam_gain             - Gain control (V4L2)\n");
-    printf("  cam_status           - Show current camera settings\n");
-    printf("  sensor_exposure_direct - Direct sensor exposure (only working direct control)\n");
-    printf("  hw_registers_dump    - Hardware register diagnostics\n");
+    printf("  cam_exposure         - Exposure (milliseconds)\n");
+    printf("  cam_gain             - Pixel gain (index)\n");
+    printf("  cam_gaina            - Analogue gain (if supported)\n");
+    printf("  cam_gaind            - Digital gain code (if supported)\n");
+    printf("  cam_3a_lock          - Lock/unlock AE/AWB/AF\n");
+    printf("  cam_focus            - Focus absolute position\n");
+    printf("  cam_flip             - Image flip (H/V)\n");
     printf("\nType 'help' for more commands\n\n");
     
     return 0;
@@ -140,19 +136,21 @@ static int help_cmd(int argc, char **argv)
     printf("  free         - Show memory info\n");
     printf("  version      - Show IDF version\n");
     printf("\nWorking Camera Commands:\n");
-    printf("  cam_red_balance      - Red color balance (100-2000)\n");
-    printf("  cam_blue_balance     - Blue color balance (100-2000)\n");
-    printf("  cam_exposure         - Exposure control (microseconds)\n");
-    printf("  cam_gain             - Gain control\n");
-    printf("  cam_status           - Display current camera settings\n");
-    printf("  sensor_exposure_direct - Direct exposure (lines, only working direct control)\n");
-    printf("  hw_registers_dump    - Hardware register diagnostics\n");
+    printf("  cam_exposure         - Exposure (milliseconds)\n");
+    printf("  cam_gain             - Pixel gain (index)\n");
+    printf("  cam_gaina            - Analogue gain (if supported)\n");
+    printf("  cam_gaind            - Digital gain code (if supported)\n");
+    printf("  cam_3a_lock          - Lock/unlock AE/AWB/AF\n");
+    printf("  cam_focus            - Focus absolute position\n");
+    printf("  cam_flip             - Image flip (H/V)\n");
     printf("\nExamples:\n");
-    printf("  cam_red_balance          # Show current red balance\n");
-    printf("  cam_red_balance 1500     # Set red balance to 1500\n");
-    printf("  cam_blue_balance 1200    # Set blue balance to 1200\n");
-    printf("  sensor_exposure_direct 2000  # Set exposure to 2000 lines\n");
-    printf("  cam_status               # Show all current settings\n");
+    printf("  cam_exposure 10          # Set exposure to 10 ms\n");
+    printf("  cam_gain 3               # Set pixel gain index\n");
+    printf("  cam_gaina 8              # Set analogue gain (if supported)\n");
+    printf("  cam_gaind 0x0200         # Set digital gain 2.00x (if supported)\n");
+    printf("  cam_3a_lock ae off       # Ensure AE is unlocked\n");
+    printf("  cam_focus 400            # Set focus position\n");
+    printf("  cam_flip h on            # Enable horizontal flip\n");
     printf("\n");
     
     return 0;
@@ -258,13 +256,11 @@ void simple_shell_start(void)
     // Register our system commands
     register_system_commands();
     
-    // Register camera control commands
-    camera_shell_register_commands();
+    // Register minimal camera control commands (A3C, exposure, gains, focus, flip)
+    extern void camera_shell_register_commands_minimal(void);
+    camera_shell_register_commands_minimal();
     
-    // Register IMX708 hardware register control commands (only if IMX708 is enabled)
-#if CONFIG_CAMERA_IMX708
-    imx708_hardware_shell_register_commands();
-#endif
+    // IMX708 hardware direct register commands disabled per simplified control set
     
     shell_running = true;
     

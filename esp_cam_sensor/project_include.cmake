@@ -31,9 +31,6 @@ if(CONFIG_CAMERA_SC035HGS)
 endif()
 
 if(CONFIG_CAMERA_IMX708)
-    if(CONFIG_CAMERA_IMX708_DEFAULT_IPA_JSON_CONFIGURATION_FILE)
-        idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH "${COMPONENT_PATH}/sensors/imx708/cfg/imx708_default.json" APPEND)
-    elseif(CONFIG_CAMERA_IMX708_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE)
-        idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH ${CONFIG_CAMERA_IMX708_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH} APPEND)
-    endif()
+    # Always use the default IPA JSON configuration file for IMX708
+    idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH "${COMPONENT_PATH}/sensors/imx708/cfg/imx708_default.json" APPEND)
 endif()

@@ -39,6 +39,8 @@ typedef struct {
     uint32_t gain_val;         // Current total gain value
     uint32_t analog_gain;      // Current analog gain
     uint32_t digital_gain;     // Current digital gain
+    // If true, ignore exposure updates (fixed shutter); adjust only gain
+    bool  fixed_exposure_en;
     
     // Image quality controls
     int8_t brightness;         // Brightness adjustment (-10 to +10)
@@ -79,6 +81,18 @@ struct imx708_cam {
 // IMX708 Exposure Control Constants
 // Using constants from imx708_regs.h: IMX708_EXPOSURE_MIN, IMX708_EXPOSURE_STEP, etc.
 #define IMX708_EXPOSURE_MAX_OFFSET  0x0006    // Offset from VTS for max exposure
+// Additional safety margin for exposure (percentage of VTS)
+#define IMX708_EXPOSURE_MAX_RATIO_PCT 95      // cap exposure to 95% of VTS as extra headroom
+
+// Stability thresholds to avoid tiny updates that cause flicker
+#define IMX708_MIN_EXPOSURE_DELTA_LINES  4     // ignore exposure changes smaller than 4 lines
+#define IMX708_MIN_TOTAL_GAIN_DELTA      5     // total_gain is x100; ignore < 0.05x changes
+
+// IMX708 common registers
+#define IMX708_REG_MODE_SELECT   0x0100
+#define IMX708_REG_GROUP_HOLD    0x0104
+// Frame length lines (VTS)
+#define IMX708_REG_FRAME_LENGTH  0x0340   // 0x0340[15:8], 0x0341[7:0]
 
 // IMX708 Gain Control Constants  
 #define IMX708_ANALOG_GAIN_MIN      0x0000    // Minimum analog gain (1x)
@@ -125,6 +139,14 @@ struct imx708_cam {
 
 static const char *TAG = "imx708";
 
+// Forward declarations for internal setters used before definition
+static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t total_gain);
+
+// Exposure clamp from Kconfig (ms -> us)
+#define IMX708_CFG_MIN_EXPOSURE_US   ((uint32_t)CONFIG_CAMERA_IMX708_EXPOSURE_MIN_MS * 1000U)
+#define IMX708_CFG_MAX_EXPOSURE_US   ((uint32_t)CONFIG_CAMERA_IMX708_EXPOSURE_MAX_MS * 1000U)
+
+#if !CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
 static const esp_cam_sensor_isp_info_t imx708_isp_info[] = {
     // Full resolution 4608x2592 15fps
     {
@@ -187,6 +209,7 @@ static const esp_cam_sensor_isp_info_t imx708_isp_info[] = {
         }
     }
 };
+#endif
 
 static const esp_cam_sensor_format_t imx708_format_info[] = {
     {
@@ -199,13 +222,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_4608x2592_regs,
         .regs_size = ARRAY_SIZE(imx708_4608x2592_regs),
         .fps = 15,
-        .isp_info = &imx708_isp_info[0],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[0],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     },
     {
         .name = "MIPI_2lane_24Minput_RAW10_2304x1296_30fps",
@@ -217,13 +245,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_2304x1296_regs,
         .regs_size = ARRAY_SIZE(imx708_2304x1296_regs),
         .fps = 30,
-        .isp_info = &imx708_isp_info[1],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[1],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     },
     {
         .name = "MIPI_2lane_24Minput_RAW10_1280x720_60fps",
@@ -235,13 +268,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_1280x720_regs,
         .regs_size = ARRAY_SIZE(imx708_1280x720_regs),
         .fps = 60,
-        .isp_info = &imx708_isp_info[2],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[2],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     },
     {
         .name = "MIPI_2lane_24Minput_RAW8_2304x1296_45fps",
@@ -253,13 +291,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_2304x1296_regs,
         .regs_size = ARRAY_SIZE(imx708_2304x1296_regs),
         .fps = 45,
-        .isp_info = &imx708_isp_info[3],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[3],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     },
     {
         .name = "MIPI_2lane_24Minput_RAW8_1280x720_90fps",
@@ -271,13 +314,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_1280x720_regs,
         .regs_size = ARRAY_SIZE(imx708_1280x720_regs),
         .fps = 90,
-        .isp_info = &imx708_isp_info[4],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[4],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     },
     {
         .name = "MIPI_2lane_24Minput_RAW10_800x640_15fps",
@@ -289,13 +337,18 @@ static const esp_cam_sensor_format_t imx708_format_info[] = {
         .regs = imx708_800x640_regs,
         .regs_size = ARRAY_SIZE(imx708_800x640_regs),
         .fps = 15,
-        .isp_info = &imx708_isp_info[5],
+        .isp_info = 
+#if CONFIG_CAMERA_IMX708_NO_IPA_JSON_CONFIGURATION_FILE
+            NULL,
+#else
+            &imx708_isp_info[5],
+#endif
         .mipi_info = {
             .mipi_clk = 450000000,
             .lane_num = 2,
             .line_sync_en = false,
         },
-        .reserved = (void*)IMX708_IPA_JSON_CONFIG_PATH,
+        .reserved = NULL,
     }
 };
 
@@ -352,6 +405,53 @@ static esp_err_t imx708_set_reg_bits(esp_sccb_io_handle_t sccb_handle, uint16_t 
     value = (reg_data & ~mask) | ((value << offset) & mask);
     ret = imx708_write(sccb_handle, reg, value);
     return ret;
+}
+
+static inline esp_err_t imx708_group_hold(esp_cam_sensor_device_t *dev, bool enable)
+{
+    // 0x0104: Grouped parameter hold (1=hold, 0=release)
+    return imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, enable ? 0x01 : 0x00);
+}
+
+static inline uint32_t imx708_min_u32(uint32_t a, uint32_t b)
+{
+    return a < b ? a : b;
+}
+
+// Read current frame length (VTS) from sensor registers
+static esp_err_t imx708_get_frame_length_lines(esp_cam_sensor_device_t *dev, uint32_t *vts_out)
+{
+    uint8_t msb = 0, lsb = 0;
+    esp_err_t ret = imx708_read(dev->sccb_handle, IMX708_REG_FRAME_LENGTH, &msb);
+    ret |= imx708_read(dev->sccb_handle, IMX708_REG_FRAME_LENGTH + 1, &lsb);
+    if (ret == ESP_OK && vts_out) {
+        *vts_out = ((uint32_t)msb << 8) | lsb;
+    }
+    return ret;
+}
+
+// Force VTS to nominal value from current format (fixed-fps guard)
+static esp_err_t imx708_enforce_nominal_vts(esp_cam_sensor_device_t *dev)
+{
+    if (!dev || !dev->cur_format || !dev->cur_format->isp_info) {
+        // No nominal VTS available (e.g. NO_IPA build) – skip enforcement
+        return ESP_OK;
+    }
+    const uint32_t nominal_vts = dev->cur_format->isp_info->isp_v1_info.vts;
+    uint32_t cur_vts = 0;
+    if (imx708_get_frame_length_lines(dev, &cur_vts) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (cur_vts != nominal_vts) {
+        ESP_LOGW(TAG, "VTS drift detected: cur=%lu, nominal=%lu. Restoring.", (unsigned long)cur_vts, (unsigned long)nominal_vts);
+        // Apply under group hold for clean boundary
+        imx708_group_hold(dev, true);
+        esp_err_t ret = imx708_write(dev->sccb_handle, IMX708_REG_FRAME_LENGTH,     (nominal_vts >> 8) & 0xFF);
+        ret |=        imx708_write(dev->sccb_handle, IMX708_REG_FRAME_LENGTH + 1,  (nominal_vts     ) & 0xFF);
+        imx708_group_hold(dev, false);
+        return ret;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t imx708_set_test_pattern(esp_cam_sensor_device_t *dev, int enable)
@@ -475,9 +575,18 @@ static esp_err_t imx708_set_exposure_val(esp_cam_sensor_device_t *dev, uint32_t 
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Calculate maximum exposure based on current VTS
-    uint32_t vts = dev->cur_format->isp_info->isp_v1_info.vts;
-    uint32_t max_exposure = vts - IMX708_EXPOSURE_MAX_OFFSET;
+    // Enforce nominal VTS (fixed fps) where available and get current VTS
+    imx708_enforce_nominal_vts(dev);
+    // Calculate maximum exposure based on VTS with extra ratio margin
+    uint32_t vts = 0;
+    if (dev->cur_format && dev->cur_format->isp_info) {
+        vts = dev->cur_format->isp_info->isp_v1_info.vts;
+    } else {
+        (void)imx708_get_frame_length_lines(dev, &vts);
+    }
+    uint32_t max_by_offset = (vts > IMX708_EXPOSURE_MAX_OFFSET) ? (vts - IMX708_EXPOSURE_MAX_OFFSET) : vts;
+    uint32_t max_by_ratio  = (vts * IMX708_EXPOSURE_MAX_RATIO_PCT) / 100;
+    uint32_t max_exposure  = imx708_min_u32(max_by_offset, max_by_ratio);
     
     // Validate exposure range
     if (exposure_val < IMX708_EXPOSURE_MIN) {
@@ -488,16 +597,32 @@ static esp_err_t imx708_set_exposure_val(esp_cam_sensor_device_t *dev, uint32_t 
         exposure_val = max_exposure;
     }
     
+    // If unchanged or too small change, skip writes to avoid flicker
+    if (cam_imx708->imx708_para.exposure_val == exposure_val ||
+        (exposure_val > cam_imx708->imx708_para.exposure_val ? (exposure_val - cam_imx708->imx708_para.exposure_val) : (cam_imx708->imx708_para.exposure_val - exposure_val)) < IMX708_MIN_EXPOSURE_DELTA_LINES) {
+        return ESP_OK;
+    }
+
     ESP_LOGD(TAG, "Setting exposure to %lu lines (VTS=%lu, max=%lu)", exposure_val, vts, max_exposure);
-    
-    // Write exposure value to register (16-bit big-endian format)
-    ret = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (exposure_val >> 8) & 0xFF);
+
+    // Write exposure value (sensor latches at frame boundary internally)
+    ret  = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (exposure_val >> 8) & 0xFF);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, exposure_val & 0xFF);
-    
+
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.exposure_val = exposure_val;
         cam_imx708->imx708_para.exposure_max = max_exposure;
-        ESP_LOGD(TAG, "Exposure set successfully to %lu lines", exposure_val);
+        // Read-back and log actual exposure in microseconds for visibility
+        uint8_t r_msb = 0, r_lsb = 0;
+        if (imx708_read(dev->sccb_handle, IMX708_REG_EXPOSURE, &r_msb) == ESP_OK &&
+            imx708_read(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, &r_lsb) == ESP_OK) {
+            uint32_t lines = ((uint32_t)r_msb << 8) | r_lsb;
+            uint32_t fps = dev->cur_format->fps;
+            uint32_t us  = (uint32_t)((uint64_t)lines * 1000000ULL / (fps * (uint64_t)vts));
+            ESP_LOGI(TAG, "Exposure applied: %lu lines (~%lu us), VTS=%lu", (unsigned long)lines, (unsigned long)us, (unsigned long)vts);
+        } else {
+            ESP_LOGD(TAG, "Exposure set successfully to %lu lines", exposure_val);
+        }
     } else {
         ESP_LOGE(TAG, "Failed to write exposure registers");
     }
@@ -516,16 +641,45 @@ static esp_err_t imx708_set_exposure_us(esp_cam_sensor_device_t *dev, uint32_t e
     // Convert microseconds to scan lines based on current format timing
     const esp_cam_sensor_format_t *format = dev->cur_format;
     uint32_t fps = format->fps;
-    uint32_t vts = format->isp_info->isp_v1_info.vts;
-    // Enforce a practical cap in microseconds to favor gain over excessive shutter
-    
+    uint32_t vts = 0;
+    if (format->isp_info) {
+        vts = format->isp_info->isp_v1_info.vts;
+    } else {
+        // Fallback: read current VTS from sensor
+        if (imx708_get_frame_length_lines(dev, &vts) != ESP_OK || vts == 0) {
+            ESP_LOGE(TAG, "Failed to get VTS for exposure conversion");
+            return ESP_FAIL;
+        }
+    }
+
+    // Clamp exposure by configured min/max (safety against over/under exposure)
+    if (exposure_us < IMX708_CFG_MIN_EXPOSURE_US) {
+        exposure_us = IMX708_CFG_MIN_EXPOSURE_US;
+    }
+    if (exposure_us > IMX708_CFG_MAX_EXPOSURE_US) {
+        exposure_us = IMX708_CFG_MAX_EXPOSURE_US;
+    }
+
     // Calculate exposure in lines: exposure_us * fps * vts / 1,000,000
-    uint64_t exposure_lines = ((uint64_t)exposure_us * fps * vts) / 1000000ULL;
-    
-    ESP_LOGD(TAG, "Converting %lu us to %llu lines (fps=%lu, vts=%lu)", 
-             exposure_us, exposure_lines, fps, vts);
-    
-    return imx708_set_exposure_val(dev, (uint32_t)exposure_lines);
+    uint64_t exposure_lines_req = ((uint64_t)exposure_us * fps * vts) / 1000000ULL;
+    uint32_t max_lines = vts - IMX708_EXPOSURE_MAX_OFFSET;
+    uint32_t ratio_lines = (vts * IMX708_EXPOSURE_MAX_RATIO_PCT) / 100;
+    if (ratio_lines < max_lines) max_lines = ratio_lines;
+
+    // Default: no compensation (no-op)
+
+    // If requested exposure exceeds per-frame budget, clamp only (let IPA adjust gain next frames)
+    if (exposure_lines_req > max_lines) {
+        ESP_LOGW(TAG, "Requested exposure %lu us (lines=%llu) exceeds budget (max_lines=%lu). Clamping only",
+                 (unsigned long)exposure_us, (unsigned long long)exposure_lines_req, (unsigned long)max_lines);
+        exposure_lines_req = max_lines;
+        // No immediate gain compensation here to avoid brightness jumps; IPA will correct on next cycle
+    }
+
+    ESP_LOGD(TAG, "Converting %lu us to %llu lines (fps=%lu, vts=%lu)",
+             (unsigned long)exposure_us, (unsigned long long)exposure_lines_req, (unsigned long)fps, (unsigned long)vts);
+
+    return imx708_set_exposure_val(dev, (uint32_t)exposure_lines_req);
 }
 
 /*
@@ -556,12 +710,16 @@ static esp_err_t imx708_set_analog_gain(esp_cam_sensor_device_t *dev, uint16_t g
     
     ESP_LOGD(TAG, "Setting analog gain to 0x%02X", gain);
     
-    // Write analog gain register
-    ret = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN, gain & 0xFF);
+    // Write analog gain register (16-bit: 0x0204 high, 0x0205 low). For IMX708 the high
+    // byte is typically 0, but write both for completeness.
+    uint8_t gain_h = (gain >> 8) & 0xFF;
+    uint8_t gain_l = (gain & 0xFF);
+    ret  = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN,     gain_h);
+    ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, gain_l);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.analog_gain = gain;
-        ESP_LOGD(TAG, "Analog gain set successfully to 0x%02X", gain);
+        ESP_LOGD(TAG, "Analog gain set successfully to 0x%02X (H=0x%02X L=0x%02X)", gain, gain_h, gain_l);
     } else {
         ESP_LOGE(TAG, "Failed to write analog gain register");
     }
@@ -584,7 +742,7 @@ static esp_err_t imx708_set_digital_gain(esp_cam_sensor_device_t *dev, uint16_t 
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Clamp gain to valid range
+    // Clamp gain to valid range (and cap max to reduce flicker bursts)
     if (gain < IMX708_DIGITAL_GAIN_MIN) {
         ESP_LOGW(TAG, "Digital gain 0x%X below minimum 0x%X, clamping", gain, IMX708_DIGITAL_GAIN_MIN);
         gain = IMX708_DIGITAL_GAIN_MIN;
@@ -623,6 +781,11 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
     if (!cam_imx708) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    // Keep FPS guard active frequently
+    imx708_enforce_nominal_vts(dev);
+
+    // Do not apply pending compensation here (disabled to avoid flicker)
     
     // Clamp total gain to valid range
     if (total_gain < IMX708_TOTAL_GAIN_MIN) {
@@ -632,7 +795,12 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
         ESP_LOGW(TAG, "Total gain %lu above maximum %d, clamping", total_gain, IMX708_TOTAL_GAIN_MAX);
         total_gain = IMX708_TOTAL_GAIN_MAX;
     }
-    
+
+    // Ignore tiny total gain changes to avoid oscillation
+    if ((total_gain > cam_imx708->imx708_para.gain_val ? (total_gain - cam_imx708->imx708_para.gain_val) : (cam_imx708->imx708_para.gain_val - total_gain)) < IMX708_MIN_TOTAL_GAIN_DELTA) {
+        return ESP_OK;
+    }
+
     ESP_LOGD(TAG, "Setting total gain to %lu (%.2fx)", total_gain, total_gain / 100.0);
     
     // Strategy: Use analog gain first (better noise performance), then digital gain
@@ -652,10 +820,18 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
     }
     
     ESP_LOGD(TAG, "Calculated gains: analog=0x%02X, digital=0x%03X", analog_gain, digital_gain);
-    
-    // Apply both gains
-    ret = imx708_set_analog_gain(dev, analog_gain);
+
+    // If unchanged, skip writes
+    if (cam_imx708->imx708_para.analog_gain == analog_gain && cam_imx708->imx708_para.digital_gain == digital_gain) {
+        cam_imx708->imx708_para.gain_val = total_gain;
+        return ESP_OK;
+    }
+
+    // Atomically program both gains under group hold
+    imx708_group_hold(dev, true);
+    ret  = imx708_set_analog_gain(dev, analog_gain);
     ret |= imx708_set_digital_gain(dev, digital_gain);
+    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.gain_val = total_gain;
@@ -793,7 +969,6 @@ static esp_err_t imx708_set_blue_gain(esp_cam_sensor_device_t *dev, uint16_t gai
  */
 static esp_err_t imx708_set_brightness(esp_cam_sensor_device_t *dev, int level)
 {
-    esp_err_t ret = ESP_OK;
     struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
     
     if (!cam_imx708) {
@@ -811,29 +986,10 @@ static esp_err_t imx708_set_brightness(esp_cam_sensor_device_t *dev, int level)
     
     ESP_LOGD(TAG, "Setting brightness to level %d", level);
     
-    // Map brightness level to digital gain adjustment
-    // Level -2: 0.8x gain, -1: 0.9x, 0: 1.0x, +1: 1.1x, +2: 1.2x
-    uint16_t brightness_gain = IMX708_DGTL_GAIN_DEFAULT;
-    switch (level) {
-        case -2: brightness_gain = (uint16_t)(IMX708_DGTL_GAIN_DEFAULT * 0.8); break;
-        case -1: brightness_gain = (uint16_t)(IMX708_DGTL_GAIN_DEFAULT * 0.9); break;
-        case 0:  brightness_gain = IMX708_DGTL_GAIN_DEFAULT; break;
-        case 1:  brightness_gain = (uint16_t)(IMX708_DGTL_GAIN_DEFAULT * 1.1); break;
-        case 2:  brightness_gain = (uint16_t)(IMX708_DGTL_GAIN_DEFAULT * 1.2); break;
-        default: brightness_gain = IMX708_DGTL_GAIN_DEFAULT; break;
-    }
-    
-    // Apply brightness through digital gain adjustment
-    ret = imx708_set_digital_gain(dev, brightness_gain);
-    
-    if (ret == ESP_OK) {
-        cam_imx708->imx708_para.brightness = level;
-        ESP_LOGD(TAG, "Brightness set successfully to level %d (gain=0x%03X)", level, brightness_gain);
-    } else {
-        ESP_LOGE(TAG, "Failed to set brightness");
-    }
-    
-    return ret;
+    // Delegate to ISP; avoid touching sensor gains here
+    cam_imx708->imx708_para.brightness = level;
+    ESP_LOGD(TAG, "Brightness (ISP) set to level %d (sensor gains unchanged)", level);
+    return ESP_OK;
 }
 
 /**
@@ -844,7 +1000,6 @@ static esp_err_t imx708_set_brightness(esp_cam_sensor_device_t *dev, int level)
  */
 static esp_err_t imx708_set_contrast(esp_cam_sensor_device_t *dev, int level)
 {
-    esp_err_t ret = ESP_OK;
     struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
     
     if (!cam_imx708) {
@@ -862,33 +1017,9 @@ static esp_err_t imx708_set_contrast(esp_cam_sensor_device_t *dev, int level)
     
     ESP_LOGD(TAG, "Setting contrast to level %d", level);
     
-    // Map contrast level to analog gain adjustment
-    // Higher contrast = higher gain for signal amplification
-    uint16_t contrast_gain = IMX708_ANA_GAIN_DEFAULT;
-    switch (level) {
-        case -2: contrast_gain = (uint16_t)(IMX708_ANA_GAIN_DEFAULT * 0.7); break;
-        case -1: contrast_gain = (uint16_t)(IMX708_ANA_GAIN_DEFAULT * 0.85); break;
-        case 0:  contrast_gain = IMX708_ANA_GAIN_DEFAULT; break;
-        case 1:  contrast_gain = (uint16_t)(IMX708_ANA_GAIN_DEFAULT * 1.15); break;
-        case 2:  contrast_gain = (uint16_t)(IMX708_ANA_GAIN_DEFAULT * 1.3); break;
-        default: contrast_gain = IMX708_ANA_GAIN_DEFAULT; break;
-    }
-    
-    // Ensure gain stays within valid range
-    if (contrast_gain < IMX708_ANA_GAIN_MIN) contrast_gain = IMX708_ANA_GAIN_MIN;
-    if (contrast_gain > IMX708_ANA_GAIN_MAX) contrast_gain = IMX708_ANA_GAIN_MAX;
-    
-    // Apply contrast through analog gain adjustment
-    ret = imx708_set_analog_gain(dev, contrast_gain);
-    
-    if (ret == ESP_OK) {
-        cam_imx708->imx708_para.contrast = level;
-        ESP_LOGD(TAG, "Contrast set successfully to level %d (gain=%d)", level, contrast_gain);
-    } else {
-        ESP_LOGE(TAG, "Failed to set contrast");
-    }
-    
-    return ret;
+    cam_imx708->imx708_para.contrast = level;
+    ESP_LOGD(TAG, "Contrast (ISP) set to level %d (sensor gains unchanged)", level);
+    return ESP_OK;
 }
 
 /**
@@ -899,7 +1030,6 @@ static esp_err_t imx708_set_contrast(esp_cam_sensor_device_t *dev, int level)
  */
 static esp_err_t imx708_set_saturation(esp_cam_sensor_device_t *dev, int level)
 {
-    esp_err_t ret = ESP_OK;
     struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
     
     if (!cam_imx708) {
@@ -917,38 +1047,10 @@ static esp_err_t imx708_set_saturation(esp_cam_sensor_device_t *dev, int level)
     
     ESP_LOGD(TAG, "Setting saturation to level %d", level);
     
-    // Map saturation level to color balance adjustments
-    // Adjust red and blue color balance to affect color saturation
-    uint32_t color_balance_calc = IMX708_COLOUR_BALANCE_DEFAULT;
-    switch (level) {
-        case -2: color_balance_calc = (uint32_t)(IMX708_COLOUR_BALANCE_DEFAULT * 0.6); break;
-        case -1: color_balance_calc = (uint32_t)(IMX708_COLOUR_BALANCE_DEFAULT * 0.8); break;
-        case 0:  color_balance_calc = IMX708_COLOUR_BALANCE_DEFAULT; break;
-        case 1:  color_balance_calc = (uint32_t)(IMX708_COLOUR_BALANCE_DEFAULT * 1.2); break;
-        case 2:  color_balance_calc = (uint32_t)(IMX708_COLOUR_BALANCE_DEFAULT * 1.4); break;
-        default: color_balance_calc = IMX708_COLOUR_BALANCE_DEFAULT; break;
-    }
-    
-    // Ensure color balance stays within valid range
-    if (color_balance_calc < IMX708_COLOUR_BALANCE_MIN) color_balance_calc = IMX708_COLOUR_BALANCE_MIN;
-    if (color_balance_calc > IMX708_COLOUR_BALANCE_MAX) color_balance_calc = IMX708_COLOUR_BALANCE_MAX;
-    
-    uint16_t color_balance = (uint16_t)color_balance_calc;
-    
-    // Apply saturation through color balance adjustments
-    ret = imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED, (color_balance >> 8) & 0xFF);
-    ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED + 1, color_balance & 0xFF);
-    ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE, (color_balance >> 8) & 0xFF);
-    ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE + 1, color_balance & 0xFF);
-    
-    if (ret == ESP_OK) {
-        cam_imx708->imx708_para.saturation = level;
-        ESP_LOGD(TAG, "Saturation set successfully to level %d (color_balance=0x%03X)", level, color_balance);
-    } else {
-        ESP_LOGE(TAG, "Failed to set saturation");
-    }
-    
-    return ret;
+    // Delegate to ISP; do not alter color balance here
+    cam_imx708->imx708_para.saturation = level;
+    ESP_LOGD(TAG, "Saturation (ISP) set to level %d (sensor gains unchanged)", level);
+    return ESP_OK;
 }
 
 static esp_err_t imx708_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_sensor_param_desc_t *qdesc)
@@ -970,7 +1072,19 @@ static esp_err_t imx708_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_se
     case ESP_CAM_SENSOR_EXPOSURE_VAL:
         qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_NUMBER;
         qdesc->number.minimum = IMX708_EXPOSURE_MIN;
-        qdesc->number.maximum = dev->cur_format->isp_info->isp_v1_info.vts - IMX708_EXPOSURE_MAX_OFFSET;
+        {
+            uint32_t vts = 0;
+            if (dev->cur_format && dev->cur_format->isp_info) {
+                vts = dev->cur_format->isp_info->isp_v1_info.vts;
+            } else {
+                (void)imx708_get_frame_length_lines(dev, &vts);
+            }
+            if (vts > IMX708_EXPOSURE_MAX_OFFSET) {
+                qdesc->number.maximum = vts - IMX708_EXPOSURE_MAX_OFFSET;
+            } else {
+                qdesc->number.maximum = IMX708_EXPOSURE_MIN;
+            }
+        }
         qdesc->number.step = IMX708_EXPOSURE_STEP;
         qdesc->default_value = IMX708_EXPOSURE_DEFAULT;
         break;
@@ -980,13 +1094,31 @@ static esp_err_t imx708_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_se
         // Convert exposure limits from lines to microseconds
         {
             uint32_t fps = dev->cur_format->fps;
-            uint32_t vts = dev->cur_format->isp_info->isp_v1_info.vts;
-            qdesc->number.minimum = (IMX708_EXPOSURE_MIN * 1000000UL) / (fps * vts);
-            qdesc->number.maximum = ((vts - IMX708_EXPOSURE_MAX_OFFSET) * 1000000UL) / (fps * vts);
+            uint32_t vts = 0;
+            if (dev->cur_format && dev->cur_format->isp_info) {
+                vts = dev->cur_format->isp_info->isp_v1_info.vts;
+            } else {
+                (void)imx708_get_frame_length_lines(dev, &vts);
+            }
+            if (vts == 0) vts = 1; // avoid div by 0
+            uint32_t min_us_vts = (IMX708_EXPOSURE_MIN * 1000000UL) / (fps * vts);
+            uint32_t max_us_vts = ((vts - IMX708_EXPOSURE_MAX_OFFSET) * 1000000UL) / (fps * vts);
+            // Intersect with configured clamps
+            uint32_t min_us = (IMX708_CFG_MIN_EXPOSURE_US > min_us_vts) ? IMX708_CFG_MIN_EXPOSURE_US : min_us_vts;
+            uint32_t max_us = (IMX708_CFG_MAX_EXPOSURE_US < max_us_vts) ? IMX708_CFG_MAX_EXPOSURE_US : max_us_vts;
+            if (max_us < min_us) {
+                // Fallback to vts-derived if misconfigured
+                min_us = min_us_vts;
+                max_us = max_us_vts;
+            }
+            qdesc->number.minimum = min_us;
+            qdesc->number.maximum = max_us;
                         // Use step of 65 to match V4L2 validation requirements
             qdesc->number.step = 65;
             // Adjust default to be a multiple of 65
             uint32_t calculated_default = (IMX708_EXPOSURE_DEFAULT * 1000000UL) / (fps * vts);
+            if (calculated_default < qdesc->number.minimum) calculated_default = qdesc->number.minimum;
+            if (calculated_default > qdesc->number.maximum) calculated_default = qdesc->number.maximum;
             qdesc->default_value = ((calculated_default / 65) * 65); // Round to nearest multiple of 65
         }
         break;
@@ -1148,7 +1280,13 @@ static esp_err_t imx708_get_para_value(esp_cam_sensor_device_t *dev, uint32_t id
         {
             // Convert current exposure from lines to microseconds
             uint32_t fps = dev->cur_format->fps;
-            uint32_t vts = dev->cur_format->isp_info->isp_v1_info.vts;
+            uint32_t vts = 0;
+            if (dev->cur_format && dev->cur_format->isp_info) {
+                vts = dev->cur_format->isp_info->isp_v1_info.vts;
+            } else {
+                (void)imx708_get_frame_length_lines(dev, &vts);
+            }
+            if (vts == 0) vts = 1;
             *(uint32_t *)arg = (cam_imx708->imx708_para.exposure_val * 1000000UL) / (fps * vts);
         }
         break;
@@ -1384,10 +1522,12 @@ static esp_err_t imx708_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id
             esp_cam_sensor_gh_exp_gain_t *value = (esp_cam_sensor_gh_exp_gain_t *)arg;
             ESP_LOGD(TAG, "set_para_value: GROUP_EXP_GAIN exposure_us=%lu, gain_index=%lu", 
                      value->exposure_us, value->gain_index);
-            
-            // Apply exposure and gain in synchronized manner
+
+            // Apply exposure and gain atomically via group hold to ensure clean transitions
+            imx708_group_hold(dev, true);
             ret = imx708_set_exposure_us(dev, value->exposure_us);
             ret |= imx708_set_total_gain(dev, value->gain_index);
+            imx708_group_hold(dev, false);
         }
         break;
         
@@ -1442,9 +1582,16 @@ static esp_err_t imx708_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id
         ESP_RETURN_ON_FALSE(size == sizeof(int), ESP_ERR_INVALID_SIZE, TAG, "Invalid size for 3A_LOCK");
         {
             int *value = (int *)arg;
-            ESP_LOGD(TAG, "set_para_value: 3A_LOCK set to %d (Note: not fully implemented)", *value);
-            // For now, just log - full implementation would lock/unlock AE/AWB/AF
-            ret = ESP_OK;
+            struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
+            if (cam_imx708) {
+                int mask = *value; // AWB(1) + AE(2) + AF(4)
+                bool ae_locked = (mask & 0x2) != 0;
+                cam_imx708->imx708_para.fixed_exposure_en = ae_locked;
+                ESP_LOGI(TAG, "3A_LOCK=%d (AE %s)", *value, ae_locked ? "locked" : "unlocked");
+                ret = ESP_OK;
+            } else {
+                ret = ESP_ERR_INVALID_STATE;
+            }
         }
         break;
         
@@ -1590,74 +1737,20 @@ static esp_err_t imx708_set_format(esp_cam_sensor_device_t *dev, const esp_cam_s
             return ret;
         }
 
-        // Initialize color balance registers for proper color reproduction
-        // Initialize Auto White Balance (AWB) system
-        ESP_LOGI(TAG, "Enabling hardware Auto White Balance for optimal color correction");
-        
-        // Enable hardware AWB algorithm for automatic color balance
-        ret = imx708_write(dev->sccb_handle, 0x3200, 0x01);  // Enable AWB algorithm
-        ret |= imx708_write(dev->sccb_handle, 0x3201, 0x01);  // AWB control enable
-        ret |= imx708_write(dev->sccb_handle, 0x3202, 0x01);  // AWB gain control enable
-        
-        // Configure AWB sensitivity and responsiveness for better low-light performance
-        ret |= imx708_write(dev->sccb_handle, 0x3203, 0x40);  // AWB speed control (slower convergence)
-        ret |= imx708_write(dev->sccb_handle, 0x3204, 0x20);  // AWB stability threshold
-        ret |= imx708_write(dev->sccb_handle, 0x3205, 0x80);  // AWB low-light sensitivity
-        ret |= imx708_write(dev->sccb_handle, 0x3206, 0x06);  // AWB gain step size (smaller steps)
-        
-        // Set AWB gain limits to prevent overcorrection
-        ret |= imx708_write(dev->sccb_handle, 0x3207, 0x80);  // Red gain min (0.5x)
-        ret |= imx708_write(dev->sccb_handle, 0x3208, 0xFF);  // Red gain max (2.0x)
-        ret |= imx708_write(dev->sccb_handle, 0x3209, 0x80);  // Blue gain min (0.5x)
-        ret |= imx708_write(dev->sccb_handle, 0x320A, 0xFF);  // Blue gain max (2.0x)
-        
-        // Enable automatic color correction matrix with improved low-light handling
-        ret |= imx708_write(dev->sccb_handle, 0x0B8E, 0x01);  // Enable auto color correction
-        ret |= imx708_write(dev->sccb_handle, 0x0B8F, 0x01);  // Color correction control
-        ret |= imx708_write(dev->sccb_handle, 0x0B94, 0x01);  // Enable additional auto correction
-        ret |= imx708_write(dev->sccb_handle, 0x0B95, 0x00);  // Auto correction mode
-        
-        // Configure low-light color correction bias to reduce green tint
-        ret |= imx708_write(dev->sccb_handle, 0x0B96, 0x90);  // Low-light red bias (increase red)
-        ret |= imx708_write(dev->sccb_handle, 0x0B97, 0x70);  // Low-light blue bias (reduce blue slightly)
-        
-        // Note: Manual color balance can still be controlled via V4L2 commands:
-        // - cam_red_balance [100-2000] for red gain adjustment
-        // - cam_blue_balance [100-2000] for blue gain adjustment
-        
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to initialize Auto White Balance system");
-            return ret;
-        }
-        ESP_LOGI(TAG, "Auto White Balance system initialized successfully");
+        // AWB/ACC left to IPA/ISP pipeline (no sensor-side AWB/ACC initialization)
 
-        // Set better default exposure and gain for adequate brightness
-        ESP_LOGD(TAG, "Setting balanced exposure and gain to avoid saturation");
-
-        // Start with long exposure budget that keeps sensor streaming at 15fps
-        uint32_t default_exposure = 0x0CB2;  // ~3250 lines
-        ret = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (default_exposure >> 8) & 0xFF);
-        ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, default_exposure & 0xFF);
-
-        // Moderate analog gain to keep headroom for IPA/manual control
-        uint16_t default_analog_gain = 0x0140;  // ~6x gain
-        ret = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN, (default_analog_gain >> 8) & 0xFF);
-        ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, default_analog_gain & 0xFF);
-
-        // Keep moderate digital gain
-        uint16_t default_digital_gain = 0x0180;  // 1.5x digital gain
-        ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN, (default_digital_gain >> 8) & 0xFF);
-        ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN + 1, default_digital_gain & 0xFF);
-
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Default exposure/gain setting failed");
-            return ret;
-        }
-
+        // Start from neutral gains (1x) and let IPA control exposure within FPS guard
+        // Force gains to 1.0x explicitly
+        (void)imx708_set_analog_gain(dev, 0x00);   // ~1x analog
+        (void)imx708_set_digital_gain(dev, 0x0100); // 1x digital
+        // And keep total gain at 1.0x
+        (void)imx708_set_total_gain(dev, IMX708_TOTAL_GAIN_MIN);
+        // Gains already forced to 1x above; keep para in sync
         if (cam_imx708) {
-            cam_imx708->imx708_para.exposure_val = default_exposure;
-            cam_imx708->imx708_para.analog_gain = default_analog_gain;
-            cam_imx708->imx708_para.digital_gain = default_digital_gain;
+            cam_imx708->imx708_para.gain_val = IMX708_TOTAL_GAIN_MIN;
+            cam_imx708->imx708_para.analog_gain = 0x00;
+            cam_imx708->imx708_para.digital_gain = 0x0100;
+            cam_imx708->imx708_para.fixed_exposure_en = false; // allow IPA to control exposure
         }
     }
 
@@ -1859,6 +1952,7 @@ esp_cam_sensor_device_t *imx708_detect(esp_cam_sensor_config_t *config)
     cam_imx708->imx708_para.gain_val = IMX708_TOTAL_GAIN_MIN;
     cam_imx708->imx708_para.analog_gain = IMX708_ANA_GAIN_DEFAULT;
     cam_imx708->imx708_para.digital_gain = IMX708_DGTL_GAIN_DEFAULT;
+    cam_imx708->imx708_para.fixed_exposure_en = false;
     
     // Image quality defaults (neutral settings)
     cam_imx708->imx708_para.brightness = 0;

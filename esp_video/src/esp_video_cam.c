@@ -12,6 +12,11 @@
 #include "esp_video_ioctl.h"
 #include "esp_video_cam.h"
 
+// Some platforms may miss this control; provide a fallback ID under CAMERA class
+#ifndef V4L2_CID_DIGITAL_GAIN
+#define V4L2_CID_DIGITAL_GAIN (V4L2_CID_CAMERA_CLASS_BASE + 0x1001)
+#endif
+
 // IMX708 custom control IDs (same as defined in imx708.c)
 #define IMX708_COLOR_BALANCE_RED    ESP_CAM_SENSOR_CLASS_ID(ESP_CAM_SENSOR_CID_CLASS_USER, 0x0100)
 #define IMX708_COLOR_BALANCE_BLUE   ESP_CAM_SENSOR_CLASS_ID(ESP_CAM_SENSOR_CID_CLASS_USER, 0x0101)
@@ -37,6 +42,14 @@ static const struct control_map s_sensor_control_map_table[] = {
     {
         .esp_cam_priv_id = ESP_CAM_SENSOR_GAIN,
         .v4l2_id = V4L2_CID_GAIN,
+    },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_ANGAIN,
+        .v4l2_id = V4L2_CID_ANALOGUE_GAIN,
+    },
+    {
+        .esp_cam_priv_id = ESP_CAM_SENSOR_DGAIN,
+        .v4l2_id = V4L2_CID_DIGITAL_GAIN,
     },
     {
         .esp_cam_priv_id = ESP_CAM_SENSOR_EXPOSURE_US,
@@ -309,12 +322,16 @@ esp_err_t esp_video_cam_set_ext_ctrls(esp_video_cam_t *cam, const struct v4l2_ex
             }
         } else {
             int32_t value_buf = ctrl->value;
+            bool is_exposure_abs = (ctrl->id == V4L2_CID_EXPOSURE_ABSOLUTE);
 
             switch (qdesc.type) {
             case ESP_CAM_SENSOR_PARAM_TYPE_NUMBER: {
                 int32_t minimum = qdesc.number.minimum;
                 int32_t maximum = qdesc.number.maximum;
                 uint32_t step = qdesc.number.step ? qdesc.number.step : 1;
+                if (is_exposure_abs && qdesc.id == ESP_CAM_SENSOR_EXPOSURE_US) {
+                    value_buf = value_buf * 100;
+                }
 
                 // Clamp to [min,max]
                 if (value_buf < minimum) value_buf = minimum;
@@ -335,7 +352,7 @@ esp_err_t esp_video_cam_set_ext_ctrls(esp_video_cam_t *cam, const struct v4l2_ex
                                  ctrl->id, value_buf, rounded, minimum, maximum, step);
                     }
                     value_buf = rounded;
-                    ctrl->value = value_buf; // reflect rounded value back
+                    ctrl->value = (is_exposure_abs && qdesc.id == ESP_CAM_SENSOR_EXPOSURE_US) ? (value_buf / 100) : value_buf;
                 }
                 break;
             }
@@ -370,7 +387,12 @@ esp_err_t esp_video_cam_set_ext_ctrls(esp_video_cam_t *cam, const struct v4l2_ex
             }
 
             if (dev_type == CAM_DEV_SENSOR) {
-                ret = esp_cam_sensor_set_para_value(cam->sensor, qdesc.id, value_ptr, value_size);
+                if (is_exposure_abs && qdesc.id == ESP_CAM_SENSOR_EXPOSURE_US) {
+                    int32_t us_value = value_buf;
+                    ret = esp_cam_sensor_set_para_value(cam->sensor, qdesc.id, &us_value, sizeof(us_value));
+                } else {
+                    ret = esp_cam_sensor_set_para_value(cam->sensor, qdesc.id, value_ptr, value_size);
+                }
             } else {
 #if CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER
                 ret = esp_cam_motor_set_para_value(cam->motor, qdesc.id, value_ptr, value_size);
@@ -442,6 +464,9 @@ esp_err_t esp_video_cam_get_ext_ctrls(esp_video_cam_t *cam, struct v4l2_ext_cont
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "failed to get ctrl id=%" PRIx32, ctrl->id);
                 break;
+            }
+            if (ctrl->id == V4L2_CID_EXPOSURE_ABSOLUTE && qdesc.id == ESP_CAM_SENSOR_EXPOSURE_US) {
+                ctrl->value = ctrl->value / 100;
             }
         }
     }
@@ -535,6 +560,15 @@ esp_err_t esp_video_cam_query_ext_ctrls(esp_video_cam_t *cam, struct v4l2_query_
     default:
         ESP_LOGD(TAG, "sensor type=%" PRIu32 " is not supported", qdesc.type);
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (qctrl->id == V4L2_CID_EXPOSURE_ABSOLUTE && qdesc.type == ESP_CAM_SENSOR_PARAM_TYPE_NUMBER && qdesc.id == ESP_CAM_SENSOR_EXPOSURE_US) {
+        if (qctrl->step < 1) qctrl->step = 1;
+        qctrl->minimum = qctrl->minimum / 100;
+        qctrl->maximum = qctrl->maximum / 100;
+        qctrl->step = qctrl->step / 100;
+        if (qctrl->step < 1) qctrl->step = 1;
+        qctrl->default_value = qctrl->default_value / 100;
     }
 
     return ESP_OK;

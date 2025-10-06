@@ -9,7 +9,6 @@
 #include "esp_log.h"
 #include "shell.h"
 #include "shell/simple_shell.h"
-#include "shell/camera_shell.h"
 
 static const char* TAG = "shell";
 
