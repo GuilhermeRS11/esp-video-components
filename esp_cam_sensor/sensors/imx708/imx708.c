@@ -67,6 +67,26 @@ typedef struct {
  */
 struct imx708_cam {
     imx708_para_t imx708_para;
+    // Simple rate limiter to avoid back-to-back parameter writes mid-stream
+    TickType_t last_param_update_tick;
+    TickType_t min_update_interval_ticks;
+    // Coalescing: store last requested values when updates are rate-limited
+    bool pending_exposure_valid;
+    uint32_t pending_exposure_lines;
+    bool pending_gain_valid;
+    uint32_t pending_total_gain;
+    // Warm-up guard after stream-on to avoid early unstable writes
+    TickType_t warmup_end_tick;
+    uint32_t warmup_frames;
+    // Pending color balance updates
+    bool pending_red_valid;
+    uint16_t pending_red_gain;
+    bool pending_blue_valid;
+    uint16_t pending_blue_gain;
+    // Staged values applied under current Group Hold (for consolidated logging on release)
+    
+    
+    
 };
 
 #define IMX708_IO_MUX_LOCK(mux)
@@ -82,10 +102,15 @@ struct imx708_cam {
 // Using constants from imx708_regs.h: IMX708_EXPOSURE_MIN, IMX708_EXPOSURE_STEP, etc.
 #define IMX708_EXPOSURE_MAX_OFFSET  0x0006    // Offset from VTS for max exposure
 // Additional safety margin for exposure (percentage of VTS)
-#define IMX708_EXPOSURE_MAX_RATIO_PCT 95      // cap exposure to 95% of VTS as extra headroom
+// Safer default headroom: cap exposure to 80% of VTS
+#define IMX708_EXPOSURE_MAX_RATIO_PCT 80
+// Ensure a minimum vertical blanking margin (in lines) to avoid starving blanking
+#define IMX708_MIN_BLANKING_LINES     64
+// Extra fixed safety margin (in microseconds) to absorb scheduling jitter near frame boundary
+#define IMX708_EXPOSURE_FIXED_MARGIN_US 2000
 
 // Stability thresholds to avoid tiny updates that cause flicker
-#define IMX708_MIN_EXPOSURE_DELTA_LINES  4     // ignore exposure changes smaller than 4 lines
+#define IMX708_MIN_EXPOSURE_DELTA_LINES  16    // ignore exposure changes smaller than 16 lines
 #define IMX708_MIN_TOTAL_GAIN_DELTA      5     // total_gain is x100; ignore < 0.05x changes
 
 // IMX708 common registers
@@ -94,13 +119,15 @@ struct imx708_cam {
 // Frame length lines (VTS)
 #define IMX708_REG_FRAME_LENGTH  0x0340   // 0x0340[15:8], 0x0341[7:0]
 
-// IMX708 Gain Control Constants  
-#define IMX708_ANALOG_GAIN_MIN      0x0000    // Minimum analog gain (1x)
-#define IMX708_ANALOG_GAIN_MAX      0x00FF    // Maximum analog gain (~16x)
-#define IMX708_DIGITAL_GAIN_MIN     0x0100    // Minimum digital gain (1x)
-#define IMX708_DIGITAL_GAIN_MAX     0x0FFF    // Maximum digital gain (~16x)
-#define IMX708_TOTAL_GAIN_MIN       100       // Minimum total gain (1.0x scaled by 100)
-#define IMX708_TOTAL_GAIN_MAX       25600     // Maximum total gain (256x scaled by 100)
+// IMX708 Gain Control Constants (align with imx708_regs.h)
+#define IMX708_ANALOG_GAIN_MIN      IMX708_ANA_GAIN_MIN     // 112 (0x0070) ~ 1.0x
+#define IMX708_ANALOG_GAIN_MAX      IMX708_ANA_GAIN_MAX     // 960 (0x03C0)
+#define IMX708_DIGITAL_GAIN_MIN     IMX708_DGTL_GAIN_MIN    // 0x0100 = 1.0x
+#define IMX708_DIGITAL_GAIN_MAX     IMX708_DGTL_GAIN_MAX    // 0xFFFF
+#define IMX708_TOTAL_GAIN_MIN       100       // 1.0x scaled by 100
+#define IMX708_TOTAL_GAIN_MAX       25600     // 256x scaled by 100
+// Approximate max analog gain factor (x100). Empirically ~8x for code 960.
+#define IMX708_ANALOG_MAX_X100      800
 
 // IMX708 Image Quality Control Ranges
 #define IMX708_BRIGHTNESS_MIN       -10       // Increased range for calibration
@@ -117,6 +144,22 @@ struct imx708_cam {
 #define IMX708_COLOR_BALANCE_BLUE_MIN   100   // Minimum blue gain (0x0100 = 1.0x)  
 #define IMX708_COLOR_BALANCE_BLUE_MAX   2000  // Maximum blue gain (0x0800 = 8.0x)
 #define IMX708_COLOR_BALANCE_BLUE_DEFAULT 280 // Default blue gain (0x0280 = 2.5x)
+
+// Freeze analog gain and drive total gain via digital gain only (for stability tests)
+// Set to 1 to freeze analog gain at default and avoid AG updates while streaming.
+#ifndef IMX708_FREEZE_ANALOG_GAIN
+#define IMX708_FREEZE_ANALOG_GAIN 1
+#endif
+
+// Test switch: freeze exposure and total gain updates (ignore runtime changes)
+// Set to 1 to disable any exposure or total gain writes after initialization
+#ifndef IMX708_FREEZE_EXPOSURE
+#define IMX708_FREEZE_EXPOSURE 0
+#endif
+
+#ifndef IMX708_FREEZE_TOTAL_GAIN
+#define IMX708_FREEZE_TOTAL_GAIN 0
+#endif
 
 // Custom Color Balance Control IDs (using user class)
 #define IMX708_COLOR_BALANCE_RED    ESP_CAM_SENSOR_CLASS_ID(ESP_CAM_SENSOR_CID_CLASS_USER, 0x0100)
@@ -407,10 +450,33 @@ static esp_err_t imx708_set_reg_bits(esp_sccb_io_handle_t sccb_handle, uint16_t 
     return ret;
 }
 
+// Track nested group-hold sections to avoid mid-frame releases when composing controls
+static int s_group_hold_depth = 0;
+
 static inline esp_err_t imx708_group_hold(esp_cam_sensor_device_t *dev, bool enable)
 {
     // 0x0104: Grouped parameter hold (1=hold, 0=release)
-    return imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, enable ? 0x01 : 0x00);
+    if (enable) {
+        // Entering hold: only write when transitioning from 0 -> 1
+        if (s_group_hold_depth == 0) {
+            esp_err_t ret = imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, 0x01);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
+        s_group_hold_depth++;
+        return ESP_OK;
+    } else {
+        // Leaving hold: protect underflow
+        if (s_group_hold_depth > 0) {
+            s_group_hold_depth--;
+        }
+        // Only release when depth reaches 0
+        if (s_group_hold_depth == 0) {
+            return imx708_write(dev->sccb_handle, IMX708_REG_GROUP_HOLD, 0x00);
+        }
+        return ESP_OK;
+    }
 }
 
 static inline uint32_t imx708_min_u32(uint32_t a, uint32_t b)
@@ -435,6 +501,10 @@ static esp_err_t imx708_enforce_nominal_vts(esp_cam_sensor_device_t *dev)
 {
     if (!dev || !dev->cur_format || !dev->cur_format->isp_info) {
         // No nominal VTS available (e.g. NO_IPA build) – skip enforcement
+        return ESP_OK;
+    }
+    // Do not enforce nominal VTS while streaming to avoid mid-frame disturbances
+    if (dev->stream_status) {
         return ESP_OK;
     }
     const uint32_t nominal_vts = dev->cur_format->isp_info->isp_v1_info.vts;
@@ -537,6 +607,16 @@ static esp_err_t imx708_set_stream(esp_cam_sensor_device_t *dev, int enable)
 
     if (ret == ESP_OK) {
         dev->stream_status = enable;
+        // After stream-on, apply warm-up guard to avoid early unstable writes
+        if (enable && dev->cur_format) {
+            struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
+            if (cam_imx708) {
+                uint32_t fps_local = dev->cur_format->fps ? dev->cur_format->fps : 15;
+                uint32_t frame_time_ms = (fps_local > 0) ? (1000 / fps_local) : 66;
+                cam_imx708->warmup_frames = 3;
+                cam_imx708->warmup_end_tick = xTaskGetTickCount() + pdMS_TO_TICKS(frame_time_ms * cam_imx708->warmup_frames);
+            }
+        }
     }
     ESP_LOGD(TAG, "Stream=%d", enable);
     return ret;
@@ -569,11 +649,16 @@ static esp_err_t imx708_set_exposure_val(esp_cam_sensor_device_t *dev, uint32_t 
 {
     esp_err_t ret = ESP_OK;
     struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
-    
+
     if (!cam_imx708) {
         ESP_LOGE(TAG, "Camera context not initialized");
         return ESP_ERR_INVALID_STATE;
     }
+
+#if IMX708_FREEZE_EXPOSURE
+    // Exposure updates are frozen for diagnostics; ignore runtime changes
+    return ESP_OK;
+#endif
     
     // Enforce nominal VTS (fixed fps) where available and get current VTS
     imx708_enforce_nominal_vts(dev);
@@ -584,9 +669,15 @@ static esp_err_t imx708_set_exposure_val(esp_cam_sensor_device_t *dev, uint32_t 
     } else {
         (void)imx708_get_frame_length_lines(dev, &vts);
     }
+    // Get current FPS from format (fallback to 15 if not available)
+    uint32_t fps = (dev->cur_format && dev->cur_format->fps) ? dev->cur_format->fps : 15;
     uint32_t max_by_offset = (vts > IMX708_EXPOSURE_MAX_OFFSET) ? (vts - IMX708_EXPOSURE_MAX_OFFSET) : vts;
     uint32_t max_by_ratio  = (vts * IMX708_EXPOSURE_MAX_RATIO_PCT) / 100;
-    uint32_t max_exposure  = imx708_min_u32(max_by_offset, max_by_ratio);
+    uint32_t max_by_margin = (vts > IMX708_MIN_BLANKING_LINES) ? (vts - IMX708_MIN_BLANKING_LINES) : vts;
+    // Convert fixed microsecond margin to line budget and reduce max further
+    uint32_t fixed_lines_margin = (uint32_t)(((uint64_t)IMX708_EXPOSURE_FIXED_MARGIN_US * fps * vts + 999999ULL) / 1000000ULL);
+    uint32_t max_by_fixed = (vts > fixed_lines_margin) ? (vts - fixed_lines_margin) : vts;
+    uint32_t max_exposure  = imx708_min_u32(imx708_min_u32(max_by_offset, max_by_ratio), imx708_min_u32(max_by_margin, max_by_fixed));
     
     // Validate exposure range
     if (exposure_val < IMX708_EXPOSURE_MIN) {
@@ -597,27 +688,70 @@ static esp_err_t imx708_set_exposure_val(esp_cam_sensor_device_t *dev, uint32_t 
         exposure_val = max_exposure;
     }
     
+    // If a pending value exists and we're allowed to update now, replace request
+    if (cam_imx708->pending_exposure_valid) {
+        exposure_val = cam_imx708->pending_exposure_lines;
+        cam_imx708->pending_exposure_valid = false;
+    }
+
     // If unchanged or too small change, skip writes to avoid flicker
     if (cam_imx708->imx708_para.exposure_val == exposure_val ||
         (exposure_val > cam_imx708->imx708_para.exposure_val ? (exposure_val - cam_imx708->imx708_para.exposure_val) : (cam_imx708->imx708_para.exposure_val - exposure_val)) < IMX708_MIN_EXPOSURE_DELTA_LINES) {
         return ESP_OK;
     }
 
+    // Rate-limit top-level updates to avoid hitting unsafe timing windows when streaming
+    if (s_group_hold_depth == 0 && cam_imx708->min_update_interval_ticks > 0) {
+        TickType_t now = xTaskGetTickCount();
+        // Warm-up guard after stream on
+        if (now < cam_imx708->warmup_end_tick) {
+            cam_imx708->pending_exposure_lines = exposure_val;
+            cam_imx708->pending_exposure_valid = true;
+            return ESP_OK;
+        }
+        if ((now - cam_imx708->last_param_update_tick) < cam_imx708->min_update_interval_ticks) {
+            // Defer: store pending and return OK
+            cam_imx708->pending_exposure_lines = exposure_val;
+            cam_imx708->pending_exposure_valid = true;
+            return ESP_OK;
+        }
+    }
+
     ESP_LOGD(TAG, "Setting exposure to %lu lines (VTS=%lu, max=%lu)", exposure_val, vts, max_exposure);
 
-    // Write exposure value (sensor latches at frame boundary internally)
-    ret  = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (exposure_val >> 8) & 0xFF);
-    ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, exposure_val & 0xFF);
+    // Write exposure (and any pending color balance) under group hold to avoid mid-frame glitches
+imx708_group_hold(dev, true);
+ret  = imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE, (exposure_val >> 8) & 0xFF);
+ret |= imx708_write(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, exposure_val & 0xFF);
+// Apply pending color balance if any
+struct imx708_cam *cctx = (struct imx708_cam *)dev->priv;
+if (ret == ESP_OK && cctx) {
+    if (cctx->pending_red_valid) {
+        ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED, (cctx->pending_red_gain >> 8) & 0xFF);
+        ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED + 1, cctx->pending_red_gain & 0xFF);
+        cctx->imx708_para.red_gain = cctx->pending_red_gain;
+        cctx->pending_red_valid = false;
+    }
+    if (cctx->pending_blue_valid) {
+        ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE, (cctx->pending_blue_gain >> 8) & 0xFF);
+        ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE + 1, cctx->pending_blue_gain & 0xFF);
+        cctx->imx708_para.blue_gain = cctx->pending_blue_gain;
+        cctx->pending_blue_valid = false;
+    }
+}
+imx708_group_hold(dev, false);
 
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.exposure_val = exposure_val;
         cam_imx708->imx708_para.exposure_max = max_exposure;
+        if (s_group_hold_depth == 0) {
+            cam_imx708->last_param_update_tick = xTaskGetTickCount();
+        }
         // Read-back and log actual exposure in microseconds for visibility
         uint8_t r_msb = 0, r_lsb = 0;
         if (imx708_read(dev->sccb_handle, IMX708_REG_EXPOSURE, &r_msb) == ESP_OK &&
             imx708_read(dev->sccb_handle, IMX708_REG_EXPOSURE + 1, &r_lsb) == ESP_OK) {
             uint32_t lines = ((uint32_t)r_msb << 8) | r_lsb;
-            uint32_t fps = dev->cur_format->fps;
             uint32_t us  = (uint32_t)((uint64_t)lines * 1000000ULL / (fps * (uint64_t)vts));
             ESP_LOGI(TAG, "Exposure applied: %lu lines (~%lu us), VTS=%lu", (unsigned long)lines, (unsigned long)us, (unsigned long)vts);
         } else {
@@ -703,19 +837,22 @@ static esp_err_t imx708_set_analog_gain(esp_cam_sensor_device_t *dev, uint16_t g
     }
     
     // Clamp gain to valid range
-    if (gain > IMX708_ANALOG_GAIN_MAX) {
+    if (gain < IMX708_ANALOG_GAIN_MIN) {
+        gain = IMX708_ANALOG_GAIN_MIN;
+    } else if (gain > IMX708_ANALOG_GAIN_MAX) {
         ESP_LOGW(TAG, "Analog gain 0x%X above maximum 0x%X, clamping", gain, IMX708_ANALOG_GAIN_MAX);
         gain = IMX708_ANALOG_GAIN_MAX;
     }
     
     ESP_LOGD(TAG, "Setting analog gain to 0x%02X", gain);
     
-    // Write analog gain register (16-bit: 0x0204 high, 0x0205 low). For IMX708 the high
-    // byte is typically 0, but write both for completeness.
+    // Write analog gain register (16-bit: 0x0204 high, 0x0205 low) under group hold
     uint8_t gain_h = (gain >> 8) & 0xFF;
     uint8_t gain_l = (gain & 0xFF);
+    imx708_group_hold(dev, true);
     ret  = imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN,     gain_h);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_ANALOG_GAIN + 1, gain_l);
+    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.analog_gain = gain;
@@ -746,16 +883,15 @@ static esp_err_t imx708_set_digital_gain(esp_cam_sensor_device_t *dev, uint16_t 
     if (gain < IMX708_DIGITAL_GAIN_MIN) {
         ESP_LOGW(TAG, "Digital gain 0x%X below minimum 0x%X, clamping", gain, IMX708_DIGITAL_GAIN_MIN);
         gain = IMX708_DIGITAL_GAIN_MIN;
-    } else if (gain > IMX708_DIGITAL_GAIN_MAX) {
-        ESP_LOGW(TAG, "Digital gain 0x%X above maximum 0x%X, clamping", gain, IMX708_DIGITAL_GAIN_MAX);
-        gain = IMX708_DIGITAL_GAIN_MAX;
     }
     
     ESP_LOGD(TAG, "Setting digital gain to 0x%03X", gain);
     
-    // Write digital gain register (16-bit big-endian format)  
+    // Write digital gain register (16-bit big-endian format) under group hold
+    imx708_group_hold(dev, true);
     ret = imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN, (gain >> 8) & 0xFF);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_DIGITAL_GAIN + 1, gain & 0xFF);
+    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.digital_gain = gain;
@@ -777,13 +913,23 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
 {
     esp_err_t ret = ESP_OK;
     struct imx708_cam *cam_imx708 = (struct imx708_cam *)dev->priv;
-    
+
     if (!cam_imx708) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Keep FPS guard active frequently
-    imx708_enforce_nominal_vts(dev);
+#if IMX708_FREEZE_TOTAL_GAIN
+    // Total gain updates are frozen for diagnostics; ignore runtime changes
+    return ESP_OK;
+#endif
+
+    // If a pending value exists and we're allowed to update now, replace request
+    if (cam_imx708->pending_gain_valid) {
+        total_gain = cam_imx708->pending_total_gain;
+        cam_imx708->pending_gain_valid = false;
+    }
+
+    // Avoid frequent VTS writes here to reduce mid-stream disturbance; exposure path enforces when needed
 
     // Do not apply pending compensation here (disabled to avoid flicker)
     
@@ -801,23 +947,55 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
         return ESP_OK;
     }
 
+    // Rate-limit top-level updates
+    if (s_group_hold_depth == 0 && cam_imx708->min_update_interval_ticks > 0) {
+        TickType_t now = xTaskGetTickCount();
+        // Warm-up guard after stream on
+        if (now < cam_imx708->warmup_end_tick) {
+            cam_imx708->pending_total_gain = total_gain;
+            cam_imx708->pending_gain_valid = true;
+            return ESP_OK;
+        }
+        if ((now - cam_imx708->last_param_update_tick) < cam_imx708->min_update_interval_ticks) {
+            cam_imx708->pending_total_gain = total_gain;
+            cam_imx708->pending_gain_valid = true;
+            return ESP_OK; // defer but remember
+        }
+    }
+
     ESP_LOGD(TAG, "Setting total gain to %lu (%.2fx)", total_gain, total_gain / 100.0);
     
     // Strategy: Use analog gain first (better noise performance), then digital gain
     uint16_t analog_gain = 0;
     uint16_t digital_gain = IMX708_DIGITAL_GAIN_MIN; // Start at 1x digital
     
-    if (total_gain <= 1600) { // Up to 16x, use only analog gain
-        // Analog gain mapping: 0x00=1x, 0x10=2x, 0x20=4x, 0x30=8x, 0xFF=~16x
-        analog_gain = (uint16_t)((total_gain - 100) * 255 / 1500);
-    } else { // Above 16x, max analog + digital gain
-        analog_gain = IMX708_ANALOG_GAIN_MAX; // Max analog gain (~16x)
-        // Digital gain for remaining: total_gain / 16
-        uint32_t remaining_gain = (total_gain * 256) / 1600; // Scale to digital gain format
-        digital_gain = (uint16_t)remaining_gain;
-        if (digital_gain < IMX708_DIGITAL_GAIN_MIN) digital_gain = IMX708_DIGITAL_GAIN_MIN;
-        if (digital_gain > IMX708_DIGITAL_GAIN_MAX) digital_gain = IMX708_DIGITAL_GAIN_MAX;
-    }
+    #if IMX708_FREEZE_ANALOG_GAIN
+        // Keep analog gain fixed at current (or default if unset), drive total gain via digital gain only
+        analog_gain = cam_imx708->imx708_para.analog_gain ? (uint16_t)cam_imx708->imx708_para.analog_gain : (uint16_t)IMX708_ANA_GAIN_DEFAULT;
+        // With analog fixed ~1.0x default, digital gain code is proportional to total_gain
+        uint32_t dgain_code = (total_gain * 256) / 100; // 256 per 1x
+        if (dgain_code < IMX708_DIGITAL_GAIN_MIN) dgain_code = IMX708_DIGITAL_GAIN_MIN;
+        if (dgain_code > IMX708_DIGITAL_GAIN_MAX) dgain_code = IMX708_DIGITAL_GAIN_MAX;
+        digital_gain = (uint16_t)dgain_code;
+    #else
+        if (total_gain <= IMX708_ANALOG_MAX_X100) {
+            // Map [1.0x..AG_max] linearly into [ANA_MIN..ANA_MAX]
+            uint32_t span = IMX708_ANALOG_GAIN_MAX - IMX708_ANALOG_GAIN_MIN;
+            uint32_t num  = (total_gain > 100) ? (total_gain - 100) : 0;
+            uint32_t den  = (IMX708_ANALOG_MAX_X100 > 100) ? (IMX708_ANALOG_MAX_X100 - 100) : 1;
+            analog_gain = (uint16_t)(IMX708_ANALOG_GAIN_MIN + (span * num) / den);
+            digital_gain = IMX708_DIGITAL_GAIN_MIN;
+        } else {
+            // Use max analog, put remainder into digital gain (8.8 fixed: 0x0100=1.0x)
+            analog_gain = IMX708_ANALOG_GAIN_MAX;
+            uint32_t remaining_x100 = (total_gain * 100) / IMX708_ANALOG_MAX_X100; // factor over 1x in x100
+            if (remaining_x100 < 100) remaining_x100 = 100;
+            uint32_t dgain_code = (remaining_x100 * 256) / 100; // 256 per 1x
+            if (dgain_code < IMX708_DIGITAL_GAIN_MIN) dgain_code = IMX708_DIGITAL_GAIN_MIN;
+            if (dgain_code > IMX708_DIGITAL_GAIN_MAX) dgain_code = IMX708_DIGITAL_GAIN_MAX;
+            digital_gain = (uint16_t)dgain_code;
+        }
+    #endif
     
     ESP_LOGD(TAG, "Calculated gains: analog=0x%02X, digital=0x%03X", analog_gain, digital_gain);
 
@@ -827,15 +1005,45 @@ static esp_err_t imx708_set_total_gain(esp_cam_sensor_device_t *dev, uint32_t to
         return ESP_OK;
     }
 
-    // Atomically program both gains under group hold
+    // Atomically program both gains (and any pending color balance) under group hold
     imx708_group_hold(dev, true);
-    ret  = imx708_set_analog_gain(dev, analog_gain);
-    ret |= imx708_set_digital_gain(dev, digital_gain);
+    #if IMX708_FREEZE_ANALOG_GAIN
+        // Do not touch analog gain when freezing
+        ret  = imx708_set_digital_gain(dev, digital_gain);
+    #else
+        ret  = imx708_set_analog_gain(dev, analog_gain);
+        ret |= imx708_set_digital_gain(dev, digital_gain);
+    #endif
+    // Apply pending color balance if any
+    struct imx708_cam *cctx2 = (struct imx708_cam *)dev->priv;
+    if (ret == ESP_OK && cctx2) {
+        if (cctx2->pending_red_valid) {
+            ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED, (cctx2->pending_red_gain >> 8) & 0xFF);
+            ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED + 1, cctx2->pending_red_gain & 0xFF);
+            cctx2->imx708_para.red_gain = cctx2->pending_red_gain;
+            cctx2->pending_red_valid = false;
+            
+            
+        }
+        if (cctx2->pending_blue_valid) {
+            ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE, (cctx2->pending_blue_gain >> 8) & 0xFF);
+            ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE + 1, cctx2->pending_blue_gain & 0xFF);
+            cctx2->imx708_para.blue_gain = cctx2->pending_blue_gain;
+            cctx2->pending_blue_valid = false;
+            
+            
+        }
+    }
     imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.gain_val = total_gain;
         ESP_LOGD(TAG, "Total gain set successfully to %lu", total_gain);
+        if (s_group_hold_depth == 0) {
+            cam_imx708->last_param_update_tick = xTaskGetTickCount();
+        }
+        
+        
     }
     
     return ret;
@@ -870,15 +1078,26 @@ static esp_err_t imx708_set_red_gain(esp_cam_sensor_device_t *dev, uint16_t gain
         gain = IMX708_COLOR_BALANCE_RED_MAX;
     }
     
-    ESP_LOGI(TAG, "imx708_set_red_gain: Setting red gain to %u (0x%03X)", gain, gain);
-    
-    // Write red gain register (16-bit big-endian format)
+    ESP_LOGD(TAG, "imx708_set_red_gain: Request red gain %u (0x%03X)", gain, gain);
+    // If we are in warm-up or cooldown, defer and coalesce under next group hold
+    if (s_group_hold_depth == 0 && cam_imx708->min_update_interval_ticks > 0) {
+        TickType_t now = xTaskGetTickCount();
+        if (now < cam_imx708->warmup_end_tick ||
+            (now - cam_imx708->last_param_update_tick) < cam_imx708->min_update_interval_ticks) {
+            cam_imx708->pending_red_gain = gain;
+            cam_imx708->pending_red_valid = true;
+            return ESP_OK;
+        }
+    }
+    // Otherwise write under group hold immediately
+    imx708_group_hold(dev, true);
     ret = imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED, (gain >> 8) & 0xFF);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_RED + 1, gain & 0xFF);
+    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.red_gain = gain;
-        ESP_LOGI(TAG, "Red gain set successfully to %u", gain);
+        ESP_LOGD(TAG, "Red gain set successfully to %u", gain);
         
         // Read back to verify the value was written correctly
         uint8_t reg_high, reg_low;
@@ -887,7 +1106,7 @@ static esp_err_t imx708_set_red_gain(esp_cam_sensor_device_t *dev, uint16_t gain
         
         if (read_ret == ESP_OK) {
             uint16_t readback = (reg_high << 8) | reg_low;
-            ESP_LOGI(TAG, "Red gain readback: 0x%04X (expected: 0x%04X)", readback, gain);
+            ESP_LOGD(TAG, "Red gain readback: 0x%04X (expected: 0x%04X)", readback, gain);
             if (readback != gain) {
                 ESP_LOGW(TAG, "Red gain readback mismatch! Expected 0x%04X, got 0x%04X", gain, readback);
             }
@@ -924,15 +1143,26 @@ static esp_err_t imx708_set_blue_gain(esp_cam_sensor_device_t *dev, uint16_t gai
         gain = IMX708_COLOR_BALANCE_BLUE_MAX;
     }
     
-    ESP_LOGI(TAG, "imx708_set_blue_gain: Setting blue gain to %u (0x%03X)", gain, gain);
-    
-    // Write blue gain register (16-bit big-endian format)
+    ESP_LOGD(TAG, "imx708_set_blue_gain: Request blue gain %u (0x%03X)", gain, gain);
+    // If we are in warm-up or cooldown, defer and coalesce under next group hold
+    if (s_group_hold_depth == 0 && cam_imx708->min_update_interval_ticks > 0) {
+        TickType_t now = xTaskGetTickCount();
+        if (now < cam_imx708->warmup_end_tick ||
+            (now - cam_imx708->last_param_update_tick) < cam_imx708->min_update_interval_ticks) {
+            cam_imx708->pending_blue_gain = gain;
+            cam_imx708->pending_blue_valid = true;
+            return ESP_OK;
+        }
+    }
+    // Otherwise write under group hold immediately
+    imx708_group_hold(dev, true);
     ret = imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE, (gain >> 8) & 0xFF);
     ret |= imx708_write(dev->sccb_handle, IMX708_REG_COLOUR_BALANCE_BLUE + 1, gain & 0xFF);
+    imx708_group_hold(dev, false);
     
     if (ret == ESP_OK) {
         cam_imx708->imx708_para.blue_gain = gain;
-        ESP_LOGI(TAG, "Blue gain set successfully to %u", gain);
+        ESP_LOGD(TAG, "Blue gain set successfully to %u", gain);
         
         // Read back to verify the value was written correctly
         uint8_t reg_high, reg_low;
@@ -941,7 +1171,7 @@ static esp_err_t imx708_set_blue_gain(esp_cam_sensor_device_t *dev, uint16_t gai
         
         if (read_ret == ESP_OK) {
             uint16_t readback = (reg_high << 8) | reg_low;
-            ESP_LOGI(TAG, "Blue gain readback: 0x%04X (expected: 0x%04X)", readback, gain);
+            ESP_LOGD(TAG, "Blue gain readback: 0x%04X (expected: 0x%04X)", readback, gain);
             if (readback != gain) {
                 ESP_LOGW(TAG, "Blue gain readback mismatch! Expected 0x%04X, got 0x%04X", gain, readback);
             }
@@ -1741,16 +1971,23 @@ static esp_err_t imx708_set_format(esp_cam_sensor_device_t *dev, const esp_cam_s
 
         // Start from neutral gains (1x) and let IPA control exposure within FPS guard
         // Force gains to 1.0x explicitly
-        (void)imx708_set_analog_gain(dev, 0x00);   // ~1x analog
+        (void)imx708_set_analog_gain(dev, IMX708_ANA_GAIN_DEFAULT);   // 1x analog per datasheet
         (void)imx708_set_digital_gain(dev, 0x0100); // 1x digital
         // And keep total gain at 1.0x
         (void)imx708_set_total_gain(dev, IMX708_TOTAL_GAIN_MIN);
         // Gains already forced to 1x above; keep para in sync
         if (cam_imx708) {
             cam_imx708->imx708_para.gain_val = IMX708_TOTAL_GAIN_MIN;
-            cam_imx708->imx708_para.analog_gain = 0x00;
+            cam_imx708->imx708_para.analog_gain = IMX708_ANA_GAIN_DEFAULT;
             cam_imx708->imx708_para.digital_gain = 0x0100;
             cam_imx708->imx708_para.fixed_exposure_en = false; // allow IPA to control exposure
+            // Initialize rate limiter to roughly one update per 2 frames (more conservative)
+            uint32_t fps_local = (format && format->fps) ? format->fps : 15;
+            uint32_t frame_time_ms = (fps_local > 0) ? (1000 / fps_local) : 66;
+            cam_imx708->min_update_interval_ticks = pdMS_TO_TICKS(frame_time_ms * 2);
+            cam_imx708->last_param_update_tick = xTaskGetTickCount();
+            cam_imx708->pending_exposure_valid = false;
+            cam_imx708->pending_gain_valid = false;
         }
     }
 
@@ -2151,3 +2388,12 @@ ESP_CAM_SENSOR_DETECT_FN(imx708_detect, ESP_CAM_SENSOR_MIPI_CSI, IMX708_SCCB_ADD
     return result;
 }
 #endif
+
+
+
+
+
+
+
+
+

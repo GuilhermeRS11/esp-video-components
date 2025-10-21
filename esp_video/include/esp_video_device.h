@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -61,6 +63,18 @@ extern "C" {
  */
 #define ESP_VIDEO_ISP1_DEVICE_ID            20
 #define ESP_VIDEO_ISP1_DEVICE_NAME          "/dev/video20"
+
+/**
+ * @brief Global camera bus lock helpers
+ *
+ * These functions provide a shared mutex protecting camera sensor/bridge
+ * access (e.g., SCCB/I2C and related ioctls). Both the ISP controller and
+ * any streaming pipeline should call these around camera ioctls to avoid
+ * contention.
+ */
+void esp_video_cam_bus_lock(void);
+void esp_video_cam_bus_unlock(void);
+bool esp_video_cam_bus_trylock(void);
 
 #ifdef __cplusplus
 }

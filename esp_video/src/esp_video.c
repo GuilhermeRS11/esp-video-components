@@ -14,6 +14,9 @@
 #include "esp_video.h"
 #include "esp_video_vfs.h"
 #include "esp_video_device.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_cam_sensor.h"
 
 #include "freertos/portmacro.h"
@@ -42,6 +45,86 @@ struct esp_video_format_desc_map {
 static _lock_t s_video_lock;
 static SLIST_HEAD(esp_video_list, esp_video) s_video_list = SLIST_HEAD_INITIALIZER(s_video_list);
 static const char *TAG = "esp_video";
+
+// Shared camera bus mutex used to serialize access between ISP and streaming
+static SemaphoreHandle_t s_cam_bus_mutex;
+static TaskHandle_t s_cam_bus_owner;
+static int s_cam_bus_recursion;
+static uint64_t s_cam_bus_acq_us;
+
+static inline uint64_t cam_time_us(void)
+{
+    // Use FreeRTOS ticks as a coarse microsecond clock to avoid extra deps
+    TickType_t t = xTaskGetTickCount();
+    return (uint64_t)t * (uint64_t)portTICK_PERIOD_MS * 1000ULL;
+}
+
+void esp_video_cam_bus_lock(void)
+{
+    if (s_cam_bus_mutex == NULL) {
+        // Lazy-create to make it available early even if init order varies
+        s_cam_bus_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+    if (s_cam_bus_mutex) {
+        const uint64_t t0 = cam_time_us();
+        xSemaphoreTakeRecursive(s_cam_bus_mutex, portMAX_DELAY);
+        const uint64_t t1 = cam_time_us();
+        const uint64_t wait_us = t1 - t0;
+        // Warn on slow acquisition (>5ms)
+#ifdef ISP_BUSLOCK_DIAG
+        if (wait_us > 5000) {
+            const char *owner = s_cam_bus_owner ? pcTaskGetName(s_cam_bus_owner) : "<none>";
+            ESP_LOGW("esp_video", "cam_bus lock wait %llu us (owner=%s, depth=%d)",
+                     (unsigned long long)wait_us, owner, s_cam_bus_recursion);
+        }
+#endif
+        if (s_cam_bus_recursion == 0) {
+            s_cam_bus_owner = xTaskGetCurrentTaskHandle();
+            s_cam_bus_acq_us = t1;
+        }
+        s_cam_bus_recursion++;
+    }
+}
+
+void esp_video_cam_bus_unlock(void)
+{
+    if (s_cam_bus_mutex) {
+        // Decrement recursion and log if long hold
+        if (s_cam_bus_recursion > 0) {
+            s_cam_bus_recursion--;
+        }
+        if (s_cam_bus_recursion == 0 && s_cam_bus_owner) {
+            const uint64_t now = cam_time_us();
+            const uint64_t hold_us = now - s_cam_bus_acq_us;
+            if (hold_us > 20000) { // >20ms hold
+#ifdef ISP_BUSLOCK_DIAG
+                const char *owner = pcTaskGetName(s_cam_bus_owner);
+                ESP_LOGW("esp_video", "cam_bus held %llu us by %s", (unsigned long long)hold_us, owner);
+#endif
+            }
+            s_cam_bus_owner = NULL;
+            s_cam_bus_acq_us = 0;
+        }
+        xSemaphoreGiveRecursive(s_cam_bus_mutex);
+    }
+}
+
+bool esp_video_cam_bus_trylock(void)
+{
+    if (s_cam_bus_mutex == NULL) {
+        s_cam_bus_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+    if (s_cam_bus_mutex == NULL) return false;
+    if (xSemaphoreTakeRecursive(s_cam_bus_mutex, 0) == pdTRUE) {
+        if (s_cam_bus_recursion == 0) {
+            s_cam_bus_owner = xTaskGetCurrentTaskHandle();
+            s_cam_bus_acq_us = cam_time_us();
+        }
+        s_cam_bus_recursion++;
+        return true;
+    }
+    return false;
+}
 
 static const struct esp_video_format_desc_map esp_video_format_desc_maps[] = {
     {
