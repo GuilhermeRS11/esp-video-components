@@ -551,6 +551,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
         // Sanitize exposure against device limits (V4L2_CID_EXPOSURE_ABSOLUTE is in 100us units)
         uint32_t apply_us = metadata->exposure;
         {
+#if CONFIG_CAMERA_IMX708
             struct v4l2_query_ext_ctrl qexp = {0};
             qexp.id = V4L2_CID_EXPOSURE_ABSOLUTE;
             if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qexp) == 0 && qexp.step > 0) {
@@ -565,6 +566,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
                 if (au > max_us) au = max_us;
                 apply_us = (uint32_t)au;
             }
+#endif
         }
         group.exposure_us = apply_us;
         group.gain_index = gain_index;
@@ -587,6 +589,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
                 isp->sensor_attr.exposure) {
             uint32_t apply_us = metadata->exposure;
             {
+#if CONFIG_CAMERA_IMX708
                 struct v4l2_query_ext_ctrl qexp = {0};
                 qexp.id = V4L2_CID_EXPOSURE_ABSOLUTE;
                 if (ioctl(isp->cam_fd, VIDIOC_QUERY_EXT_CTRL, &qexp) == 0 && qexp.step > 0) {
@@ -600,6 +603,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
                     if (au > max_us) au = max_us;
                     apply_us = (uint32_t)au;
                 }
+#endif
             }
             controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
             controls.count      = 1;
@@ -610,7 +614,7 @@ static void config_exposure_and_gain(esp_video_isp_t *isp, esp_ipa_metadata_t *m
                 ESP_LOGE(TAG, "failed to set exposure time");
             } else {
                 isp->sensor.cur_exposure = apply_us;
-                            }
+                        }
         }
 
         if ((metadata->flags & IPA_METADATA_FLAGS_GN) &&
@@ -950,6 +954,8 @@ static void isp_task(void *p)
             ESP_LOGE(TAG, "failed to process image algorithm");
             continue;
         }
+
+        #if CONFIG_ESP_VIDEO_ENABLE_CAMERA_TELEMETRY
         // Compact telemetry: log key metadata at a low rate for tuning
         {
             static uint32_t s_log_counter = 0;
@@ -959,6 +965,7 @@ static void isp_task(void *p)
                 n += snprintf(buf + n, sizeof(buf) - n, "[META]");
                 // Report applied exposure from the camera driver when possible
                 {
+#if CONFIG_CAMERA_IMX708
                     struct v4l2_ext_controls c = {0};
                     struct v4l2_ext_control  ctrl[1] = {0};
                     c.ctrl_class = V4L2_CID_CAMERA_CLASS;
@@ -968,7 +975,9 @@ static void isp_task(void *p)
                     if (ioctl(isp->cam_fd, VIDIOC_G_EXT_CTRLS, &c) == 0) {
                         unsigned applied_us = (unsigned)ctrl[0].value * 100U;
                         n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", applied_us);
-                    } else if (isp->sensor.cur_exposure) {
+                    } else
+#endif
+                    if (isp->sensor.cur_exposure) {
                         n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->sensor.cur_exposure);
                     } else if (isp->metadata.flags & IPA_METADATA_FLAGS_ET) {
                         n += snprintf(buf + n, sizeof(buf) - n, " exp=%uus", (unsigned)isp->metadata.exposure);
@@ -981,6 +990,7 @@ static void isp_task(void *p)
                 }
                 // Try to fetch current analogue/digital gains for detailed logging
                 {
+#if CONFIG_CAMERA_IMX708
                     struct v4l2_ext_controls c = {0};
                     struct v4l2_ext_control  ctrl[1] = {0};
                     // Analogue gain (raw code)
@@ -1002,6 +1012,7 @@ static void isp_task(void *p)
                         float dg = (ctrl[0].value > 0) ? (ctrl[0].value / 256.0f) : 0.0f;
                         n += snprintf(buf + n, sizeof(buf) - n, " dg=%.2f", (double)dg);
                     }
+#endif
                 }
 
                 if (isp->metadata.flags & IPA_METADATA_FLAGS_RG) {
@@ -1030,6 +1041,7 @@ static void isp_task(void *p)
                 ESP_LOGI(TAG, "%s", buf);
             }
         }
+        #endif // CONFIG_ESP_VIDEO_ENABLE_CAMERA_TELEMETRY
 
         config_isp_and_camera(isp, &isp->metadata);
     }
@@ -1108,6 +1120,7 @@ static esp_err_t init_cam_dev(const esp_video_isp_config_t *config, esp_video_is
     }
 
     qctrl.id = V4L2_CID_EXPOSURE_ABSOLUTE;
+#if CONFIG_CAMERA_IMX708
     ret = ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &qctrl);
     if (ret == 0) {
         controls.ctrl_class = V4L2_CID_CAMERA_CLASS;
@@ -1150,6 +1163,9 @@ static esp_err_t init_cam_dev(const esp_video_isp_config_t *config, esp_video_is
     } else {
         ESP_LOGD(TAG, "V4L2_CID_EXPOSURE_ABSOLUTE is not supported");
     }
+#else
+    (void)ret;
+#endif
 
     qctrl.id = V4L2_CID_CAMERA_STATS;
     ret = ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &qctrl);

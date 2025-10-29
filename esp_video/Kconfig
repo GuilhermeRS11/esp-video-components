@@ -269,6 +269,17 @@ menu "Espressif Video Configuration"
                     - Compatible autofocus motor hardware
                     - AF algorithm enabled in IPA configuration
         endif
+
+        config ESP_VIDEO_ENABLE_CAMERA_TELEMETRY
+            bool "Enable compact camera telemetry logs"
+            default n
+            help
+                Enable periodic compact telemetry logs from the ISP pipeline with
+                applied exposure time, gains and key metadata for tuning.
+
+                Disabling reduces logging overhead and avoids extra control reads
+                from the camera driver on platforms/sensors that do not implement
+                those controls.
     endif
 
     config ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER
